@@ -1,8 +1,13 @@
 # O-RAN DHCP Tools — User Guide
 
-**Version:** 3.0.0
+**Version:** 4.0.0
 **Last Updated:** 2026-03-19
-**Packages Covered:** `oran-dhcp-gen` v2.0.0 · `dhcp-lease-list` v1.3.0
+**Packages Covered:** `oran-dhcp-gen` v2.3.0 · `dhcp-oru-toolkit` v2.1.2
+
+> The lease viewer was renamed. `dhcp-lease-list` 1.3.0 became the
+> `dhcp-oru-toolkit` package at 2.0.0, which ships `dhcp-lease-list` and
+> `dhcp-forensics`, and now lives in its own repository
+> (`RoboFarm/oran-dhcp`). Its section below covers the current release.
 
 ---
 
@@ -46,7 +51,7 @@ This toolset simplifies deployment and monitoring of DHCP services for O-RAN O-R
 
 | Package | Version | Binary | Purpose |
 |---------|---------|--------|---------|
-| `oran-dhcp-gen` | 2.0.0 | `oran-dhcp-gen` | Generate ISC and Kea DHCP configs from YAML |
+| `oran-dhcp-gen` | 2.3.0 | `oran-dhcp-gen` | Generate ISC and Kea DHCP configs from YAML |
 | `dhcp-lease-list` | 1.3.0 | `dhcp-lease-list` | View IPv4 + IPv6 leases for ISC and Kea DHCP |
 
 ---
@@ -57,7 +62,7 @@ Both packages are `.deb` files. Install with `apt` for automatic dependency hand
 
 ```bash
 # Install config generator (requires python3, python3-yaml)
-sudo apt install ./oran-dhcp-gen_2.0.0_all.deb
+sudo apt install ./oran-dhcp-gen_2.3.0_all.deb
 
 # Install lease viewer (requires python3)
 sudo apt install ./dhcp-lease-list_1.3.0_all.deb
@@ -65,7 +70,7 @@ sudo apt install ./dhcp-lease-list_1.3.0_all.deb
 
 **Verify:**
 ```bash
-oran-dhcp-gen --version   # oran-dhcp-gen 2.0.0
+oran-dhcp-gen --version   # oran-dhcp-gen 2.3.0
 dhcp-lease-list --version # dhcp-lease-list 1.3.0
 ```
 
@@ -106,10 +111,25 @@ Arguments:
 
 Options:
   --target {isc,kea,all}   Output target (default: isc)
-  --outdir DIR             Output directory (default: current dir)
+  --outdir DIR             Output directory (default: a temp dir with --deploy,
+                           the current directory otherwise)
+  --deploy                 Copy generated configs to their system paths,
+                           backing up each existing file to <name>.bak.<stamp>
+  --restart                Restart the DHCP service(s) after deploying
+                           (requires --deploy)
+  --no-timestamp           Omit the generation time from config headers, so
+                           output depends only on the input YAML
   --version                Show version and exit
   --help                   Show help
 ```
+
+`--deploy` writes to `/etc/dhcp/`, `/etc/default/` and `/etc/kea/`, so it needs
+`sudo`. Every file it replaces is backed up first with a timestamped suffix.
+
+`--no-timestamp` exists so that generated output can be byte-compared against a
+known-good reference. With the timestamp in place, every such diff shows a
+spurious header line; without it, an empty diff means the configs are genuinely
+identical. The test suite relies on this.
 
 **Examples:**
 ```bash
@@ -124,6 +144,13 @@ oran-dhcp-gen oran_dhcp.yaml --target all --outdir /tmp/all-out/
 
 # Validate YAML without deploying (review stdout for errors)
 oran-dhcp-gen oran_dhcp.yaml --target isc --outdir /tmp/test/
+
+# Deploy to /etc and restart the service in one step
+sudo oran-dhcp-gen oran_dhcp.yaml --target kea --deploy --restart
+
+# Byte-compare against the configs currently deployed
+oran-dhcp-gen oran_dhcp.yaml --target kea --outdir /tmp/new/ --no-timestamp
+diff /tmp/new/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
 ```
 
 ---
@@ -198,8 +225,10 @@ oru_classes:
 | `match_prefix` | Yes | Vendor-class-identifier prefix. `""` = catch-all |
 | `controller` | Yes | Must match a `name` in the `controllers` list |
 | `protocol` | Yes | `ssh` or `tls` |
-| `ipv4_range` | Yes | Both IPv4 and IPv6 are required |
-| `ipv6_range` | Yes | Both IPv4 and IPv6 are required |
+| `ipv4_range` | No | Omit to disable IPv4 for this class (since 2.2.0) |
+| `ipv6_range` | No | Omit to disable IPv6 for this class (since 2.2.0) |
+| `lease_profile` | No | Name of an entry in `lease_profiles` (since 2.2.0) |
+| `ca_ra` / `ca_ra_profile` | No | CA/RA bootstrap chain; only takes effect when `protocol: tls` |
 | `options.interface_mtu` | No | Sets DHCP option 26 (MTU) |
 
 **Protocol TLV encoding:**
@@ -208,6 +237,43 @@ oru_classes:
 |----------|-----------------|-----------------|
 | `ssh` | `81:04:<IPv4>` | `00:81:00:10:<IPv6>` |
 | `tls` | `81:04:<IPv4>:86:01:01` | `00:81:00:10:<IPv6>:00:86:00:01:01` |
+
+#### `lease_profiles` — Reusable Lease Times (since 2.2.0)
+
+Named lease-time sets that classes reference by name, so a change lands in one
+place instead of in every class:
+
+```yaml
+lease_profiles:
+  short:
+    default_lease_time: 600
+    max_lease_time: 1200
+```
+
+A class opts in with `lease_profile: short`. Lease times are emitted at **pool**
+scope for ISC — dhcpd ignores them at class scope, which is a common way for a
+hand-written config to look right and behave otherwise.
+
+#### `ca_ra_profiles` — Certificate Enrollment Chains (since 2.2.0)
+
+Named CA/RA bootstrap settings for O-RUs that enroll for a certificate before
+calling home. Referenced per class as `ca_ra_profile: <name>`, or given inline
+as a `ca_ra:` block:
+
+```yaml
+ca_ra_profiles:
+  att:
+    server_ipv6: "fd00:8b36:f2a9::24:dc"
+    port: 8091
+    path: "/pkix/"
+    subject_dn: "..."
+    protocol: http
+```
+
+These populate O-RAN sub-options `0x01` (CA server IP), `0x03` (port), `0x04`
+(URI path), `0x05` (subject DN) and `0x06` (application protocol). **A `ca_ra`
+block only takes effect when the class sets `protocol: tls`** — it is silently
+irrelevant for `ssh` classes.
 
 #### `subnets` — Network Configuration
 
@@ -588,14 +654,26 @@ sudo systemctl restart systemd-journald
 
 | Version | Changes |
 |---------|---------|
+| 2.3.0 | `--no-timestamp` for byte-reproducible output. Malformed YAML fails with a message rather than a traceback. Repo restructured; version now substituted from one source at build time; test suite added |
+| 2.2.3 | **FIX** Kea option-43/17 was emitted as a binary blob nested under sub-option `0x01`, so Kea re-wrapped it and O-RUs never learned the controller IP. Kea now gets typed per-sub-option data. Configs validated cleanly throughout, so `kea-dhcp4 -t` never flagged it |
+| 2.2.2 | Multi-line ISC TLV emission for long bootstrap chains (presentation only; wire bytes unchanged) |
+| 2.2.1 | Spec-compliant `0x86` byte, derived automatically from `class.protocol` |
+| 2.2.0 | `lease_profiles`, `ca_ra_profiles`, per-class IPv4/IPv6 enable/disable, pool-scoped lease times, `--deploy` / `--restart` |
 | 2.0.0 | Added Kea DHCP target (`kea-dhcp4.conf`, `kea-dhcp6.conf`). `--target` now accepts `isc`, `kea`, or `all` |
 | 1.1.0 | Added `isc-dhcp-server` defaults file generation (`/etc/default/isc-dhcp-server`) |
 | 1.0.0 | Initial release — ISC DHCP IPv4 + IPv6 config generation from YAML |
 
-### dhcp-lease-list
+### dhcp-lease-list / dhcp-oru-toolkit
+
+Now developed in `RoboFarm/oran-dhcp`; see that repository for the current
+changelog.
 
 | Version | Changes |
 |---------|---------|
+| 2.1.2 | Documented reading lease files without sudo (`_kea` group; a `chmod` does not survive Kea's lease-file cleanup) |
+| 2.1.1 | **FIX** an unreadable Kea lease file was reported as "not found", because `Path.exists()` raises on Python ≤3.12 and returns False on 3.13+ |
+| 2.1.0 | Kea as a first-class server: `--server auto`/`both`, lease path read from the Kea config, LFC generations read, journal replay, MAC recovery from DUID and client-id, UTC timestamps |
+| 2.0.0 | Renamed to `dhcp-oru-toolkit`; adds `dhcp-forensics` and `--conflicts` |
 | 1.3.0 | Added Kea DHCP CSV lease file support. Added `--server {isc,kea}` switch. Extended `--state` with `declined` and `released`. Kea journal-aware deduplication |
 | 1.2.1 | Fixed DUID-EN MAC extraction for 2-byte enterprise number (O-RAN equipment) |
 | 1.2.0 | Added DUID-EN (type 2) support. Fixed IPv4 active lease dedup priority |

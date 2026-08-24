@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+echo "oran-dhcp-gen v@VERSION@ installed."
+echo ""
+echo "What's new in @VERSION@:"
+@WHATSNEW@
+echo ""
+echo "Usage:"
+echo "  oran-dhcp-gen oran_dhcp.yaml                          # generate only"
+echo "  oran-dhcp-gen oran_dhcp.yaml --deploy --restart       # deploy"
+echo ""
+echo "Example YAML model: /usr/share/oran-dhcp-gen/oran_dhcp.yaml.example"

@@ -1,0 +1,86 @@
+.TH ORAN-DHCP-GEN 1 "@DATE@" "@VERSION@" "User Commands"
+.SH NAME
+oran-dhcp-gen \- O-RAN DHCP configuration generator
+.SH SYNOPSIS
+.B oran-dhcp-gen
+\fIoran_dhcp.yaml\fR
+[\fB\-\-target\fR \fI{isc,kea,all}\fR]
+[\fB\-\-outdir\fR \fIDIR\fR]
+[\fB\-\-deploy\fR]
+[\fB\-\-restart\fR]
+.SH DESCRIPTION
+Generates DHCP server configuration files from a YAML data model.
+When used with --deploy, backs up existing config files with a
+timestamped suffix before overwriting them.
+.SH OPTIONS
+.TP
+.B \-\-target {isc,kea,all}
+Output target (default: isc).
+.TP
+.B \-\-outdir DIR
+Output directory (default: temp dir when --deploy, current dir otherwise).
+.TP
+.B \-\-deploy
+Deploy generated configs to system paths with timestamped backups.
+Requires root/sudo to write to /etc/dhcp/, /etc/kea/, /etc/default/.
+.TP
+.B \-\-restart
+Restart DHCP services after successful deploy. Requires --deploy.
+.TP
+.B \-\-version
+Show version and exit.
+.SH "YAML SCHEMA (v2.2.0)"
+The YAML model has four top-level sections plus oru_classes:
+.TP
+.B global
+default_lease_time, max_lease_time, oran_enterprise_id (53148).
+.TP
+.B controllers
+List of named controllers with ipv4 and ipv6 addresses.
+.TP
+.B lease_profiles (optional, NEW in 2.2.0)
+Named reusable lease parameter sets. Reference from a class via
+\fIlease_profile: <name>\fR. Generator emits these at POOL scope
+(where they take effect in ISC) and as per-class lifetimes in Kea.
+.TP
+.B ca_ra_profiles (optional, NEW in 2.2.0)
+Named reusable TLS CA/RA bootstrap settings (CA server IP, URI path,
+subject DN, app protocol, NETCONF mode byte). Reference from a class
+via \fIca_ra: { profile: <name>, port: N, ... }\fR.
+.TP
+.B oru_classes
+List of O-RU classes. \fIipv4_range\fR and \fIipv6_range\fR are now
+both optional (NEW in 2.2.0); omit to disable that family for the class.
+At least one must be present.
+.SH DEPLOY PATHS
+.TP
+dhcpd.conf \-> /etc/dhcp/dhcpd.conf
+.TP
+dhcpd6.conf \-> /etc/dhcp/dhcpd6.conf
+.TP
+isc-dhcp-server \-> /etc/default/isc-dhcp-server
+.TP
+kea-dhcp4.conf \-> /etc/kea/kea-dhcp4.conf
+.TP
+kea-dhcp6.conf \-> /etc/kea/kea-dhcp6.conf
+.SH BACKUP FORMAT
+Backups are named: <original_file>.bak.YYYYMMDD-HHMMSS
+Example: /etc/dhcp/dhcpd.conf.bak.20260504-143022
+.SH EXAMPLES
+.TP
+Generate ISC DHCP configs to current directory:
+.B oran-dhcp-gen oran_dhcp.yaml
+.TP
+Generate and deploy ISC DHCP configs with backup:
+.B sudo oran-dhcp-gen oran_dhcp.yaml --deploy
+.TP
+Generate, deploy, and restart ISC DHCP:
+.B sudo oran-dhcp-gen oran_dhcp.yaml --deploy --restart
+.TP
+Full Kea DHCP workflow:
+.B sudo oran-dhcp-gen oran_dhcp.yaml --target kea --deploy --restart
+.SH SEE ALSO
+.BR dhcpd (8),
+.BR kea-dhcp4 (8),
+.BR kea-dhcp6 (8),
+.BR dhcp-lease-list (1)
