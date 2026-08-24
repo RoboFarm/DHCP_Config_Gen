@@ -19,7 +19,7 @@ tests/update_goldens.sh               # regenerate goldens after an intended cha
 docs/ORAN_DHCP_USER_GUIDE.md          # user guide
 
 References/oran-dhcp-gen_2_2_3_all.deb   # the original v2.2.3 package, kept for reference
-References/isc/Lab03/                    # hand-written golden ISC configs from a real lab
+References/isc/Lab03/                    # hand-written golden ISC configs from a real lab (pre-generator)
 References/kea/Lab4/                     # oran_dhcp.yaml + the kea-dhcp{4,6}.conf it generates
 ```
 
@@ -31,6 +31,8 @@ Run the script directly during development: `python3 bin/oran-dhcp-gen ...`.
 `@VERSION@` and are filled in by `build-deb.sh`, which also refuses to build unless the
 changelog leads with the same version and generates the postinst "what's new" banner from
 the top changelog entry. Do not hand-write a version into those files; a test enforces it.
+
+**Keep the user guide in sync.** `docs/ORAN_DHCP_USER_GUIDE.md` was rewritten for v2.2.3 on 2026-08-24 (guide v4.0.0) and documents `lease_profiles`, `ca_ra_profiles`, optional per-class ranges, the CA/RA sub-option codes, and `--deploy`/`--restart`. It had previously drifted two minor versions behind, which is how the 2.2.x features went undocumented — when you change behaviour, update the guide and the changelog in the same change. The man page no longer needs manual attention: `build-deb.sh` stamps it from `__version__`.
 
 ## Commands
 

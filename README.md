@@ -99,6 +99,11 @@ a "v2.2.3 installed" header.)
 
 ## Notes before you change anything
 
+- **Keep the docs in sync with the script.** A behaviour change should land alongside the
+  user guide and the changelog in the same commit. The guide had drifted two minor versions
+  before, which is how the whole 2.2.x feature set went undocumented, and the man page was
+  stamped 2.2.2 while the package said 2.2.3. The man page no longer needs manual attention
+  — `build-deb.sh` stamps it from `__version__` — but the guide still does.
 - **The vendor options are built twice** — as raw bytes for ISC, and as structured
   sub-options for Kea to encode itself. `resolve_suboptions()` re-encodes the structured form
   and aborts generation if it does not match the ISC bytes exactly. Change one representation
