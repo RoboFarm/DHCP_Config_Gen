@@ -1,0 +1,21 @@
+# Generator output written into the repo root (References/ copies stay tracked)
+/dhcpd.conf
+/dhcpd6.conf
+/isc-dhcp-server
+/kea-dhcp4.conf
+/kea-dhcp6.conf
+/out/
+/build/
+
+# Packages built from pkg/ (the shipped one under References/ stays tracked)
+/*.deb
+
+# Backups left by --deploy and by editors
+*.bak
+*.bak.*
+*~
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
