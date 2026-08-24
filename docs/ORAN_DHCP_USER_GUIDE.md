@@ -2,7 +2,12 @@
 
 **Version:** 4.0.0
 **Last Updated:** 2026-08-24
-**Packages Covered:** `oran-dhcp-gen` v2.2.3 · `dhcp-lease-list` v1.3.0
+**Packages Covered:** `oran-dhcp-gen` v2.3.0 · `dhcp-oru-toolkit` v2.1.2
+
+> The lease viewer was renamed. `dhcp-lease-list` 1.3.0 became the
+> `dhcp-oru-toolkit` package at 2.0.0, which ships `dhcp-lease-list` and
+> `dhcp-forensics`, and now lives in its own repository
+> (`RoboFarm/oran-dhcp`).
 
 ---
 
@@ -54,7 +59,7 @@ This toolset simplifies deployment and monitoring of DHCP services for O-RAN O-R
 
 | Package | Version | Binary | Purpose |
 |---------|---------|--------|---------|
-| `oran-dhcp-gen` | 2.2.3 | `oran-dhcp-gen` | Generate ISC and Kea DHCP configs from YAML |
+| `oran-dhcp-gen` | 2.3.0 | `oran-dhcp-gen` | Generate ISC and Kea DHCP configs from YAML |
 | `dhcp-lease-list` | 1.3.0 | `dhcp-lease-list` | View IPv4 + IPv6 leases for ISC and Kea DHCP |
 
 ---
@@ -65,7 +70,7 @@ Both packages are `.deb` files. Install with `apt` for automatic dependency hand
 
 ```bash
 # Install config generator (requires python3 >= 3.6, python3-yaml)
-sudo apt install ./oran-dhcp-gen_2_2_3_all.deb
+sudo apt install ./oran-dhcp-gen_2.3.0_all.deb
 
 # Install lease viewer (requires python3)
 sudo apt install ./dhcp-lease-list_1.3.0_all.deb
@@ -73,7 +78,7 @@ sudo apt install ./dhcp-lease-list_1.3.0_all.deb
 
 **Verify:**
 ```bash
-oran-dhcp-gen --version   # oran-dhcp-gen 2.2.3
+oran-dhcp-gen --version   # oran-dhcp-gen 2.3.0
 dhcp-lease-list --version # dhcp-lease-list 1.3.0
 ```
 
@@ -124,6 +129,8 @@ Options:
                            backing up anything already there
   --restart                Restart the DHCP service(s) after a successful
                            deploy. Requires --deploy
+  --no-timestamp           Omit the generation time from config headers, so
+                           output depends only on the input YAML
   --version                Show version and exit
   --help                   Show help
 ```
@@ -144,6 +151,12 @@ oran-dhcp-gen oran_dhcp.yaml --target all --outdir /tmp/test/
 
 # Full production rollout, both servers
 sudo oran-dhcp-gen oran_dhcp.yaml --target all --deploy --restart
+
+# Byte-compare against what is currently deployed. --no-timestamp makes the
+# output depend only on the YAML, so an empty diff means the configs really
+# are identical rather than differing only in their header line.
+oran-dhcp-gen oran_dhcp.yaml --target kea --outdir /tmp/new/ --no-timestamp
+diff /tmp/new/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
 ```
 
 Validation runs before anything is written. On success the generator prints a summary line:
@@ -871,6 +884,7 @@ sudo systemctl restart isc-dhcp-server
 
 | Version | Changes |
 |---------|---------|
+| 2.3.0 | `--no-timestamp` for byte-reproducible output. Malformed or empty YAML now fails with a message rather than a traceback. Repo restructured (`bin/`, `packaging/`, `tests/`, `examples/`, `docs/`); the version is substituted from `__version__` at build time instead of living in five hand-edited places; test suite added |
 | 2.2.3 | **Fixed Kea option 43/17 encoding** (regression from 2.2.0). Payload had been emitted as one binary blob under sub-option `0x01`, which Kea wrapped in its own TLV — O-RUs never learned the controller IP although the config validated cleanly. Kea now emits typed `option-def` / `option-data` per O-RAN sub-option and builds the TLVs itself, matching ISC wire bytes. DHCPv6 `vendor-opts` container forced with `always-send`. Added a generation-time cross-check that re-encodes the Kea representation and aborts on any divergence from the ISC bytes. Commas in string sub-option values escaped for Kea. ISC output unchanged |
 | 2.2.2 | Multi-line ISC TLV emission — chains of 3+ sub-options render one sub-option per line. Presentation only; wire bytes unchanged |
 | 2.2.1 | Sub-option `0x86` derived from `class.protocol` per O-RAN WG4 §6.2.5. `ca_ra_profiles[].netconf_mode_byte` deprecated (still honoured, now warns) |

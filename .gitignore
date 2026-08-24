@@ -1,13 +1,16 @@
-# Generator output written into the repo root (References/ copies stay tracked)
+# Build output
+/build/
+/dist/
+/out/
+
+# Generator output written into the repo root
 /dhcpd.conf
 /dhcpd6.conf
 /isc-dhcp-server
 /kea-dhcp4.conf
 /kea-dhcp6.conf
-/out/
-/build/
 
-# Packages built from pkg/ (the shipped one under References/ stays tracked)
+# Packages built from this tree (the shipped one under References/ stays tracked)
 /*.deb
 
 # Backups left by --deploy and by editors

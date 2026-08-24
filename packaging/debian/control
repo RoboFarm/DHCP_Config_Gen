@@ -1,5 +1,5 @@
 Package: oran-dhcp-gen
-Version: 2.2.3
+Version: @VERSION@
 Section: net
 Priority: optional
 Architecture: all

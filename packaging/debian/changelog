@@ -1,0 +1,152 @@
+oran-dhcp-gen (2.3.0) stable; urgency=medium
+
+  * NEW --no-timestamp: omit the generation time from config headers so that
+    output is a pure function of the input YAML. Without it every diff against
+    a reference config showed a spurious header line and the regression check
+    degraded into "ignore line 4".
+  * FIX malformed or empty YAML raised a bare traceback out of yaml.safe_load
+    instead of the [ERROR] message every other input problem produces.
+  * Repository restructured. The source used to live at
+    pkg/usr/local/bin/oran-dhcp-gen -- a Debian staging path doubling as the
+    source tree, which meant pkg/ was both input and output and could not be
+    cleaned, and the changelog and man page were committed gzipped and so were
+    undiffable in git. Now: bin/ (source), packaging/debian/ (plain-text
+    changelog and man page, gzipped at build time), tests/, examples/, docs/.
+    pkg/ is gone; build output goes to build/ and dist/.
+  * NEW packaging/debian/build-deb.sh builds the .deb and substitutes the
+    version from __version__ into control, postinst and the man page. The
+    version previously lived in five hand-edited places and had drifted: the
+    shipped 2.2.3 man page said 2.2.2, and its postinst announced "What's new
+    in 2.2.2" under a "v2.2.3 installed" header. The build now also refuses to
+    run if the changelog does not lead with __version__, and generates the
+    postinst "what's new" banner from the top changelog entry.
+  * NEW test suite (tests/run_tests.py, runs with or without pytest). Golden
+    files for both reference inputs, plus checks that ISC and Kea emit the same
+    O-RAN sub-option codes per class, that every Kea vendor option-def is typed
+    rather than a pre-built blob, and that sub-option 0x81 appears at the top
+    level -- the three properties whose absence let the 2.2.0-2.2.2 option-43
+    defect ship three times while kea-dhcp4 -t validated cleanly.
+
+ -- labuser <labuser@dhcp-server>  Mon, 24 Aug 2026 20:15:00 +0000
+
+oran-dhcp-gen (2.2.3) stable; urgency=high
+
+  * FIX Kea backend option-43/17 encoding (regression introduced in 2.2.0).
+    The vendor payload was emitted as a pre-built binary TLV blob nested
+    under sub-option code 1; Kea wraps any vendor-space option-data in
+    that sub-option's own TLV header, producing on the wire:
+      v4: 01 LL <payload>            instead of   81 04 <ip> [...]
+      v6: 00:01 LLLL <payload>       instead of   00:81 0010 <ip6> [...]
+    O-RU firmware walking top-level sub-options finds unknown code 0x01,
+    skips it, never learns the controller IP -> DHCP lease OK but no
+    NETCONF call-home. Configs validated cleanly, so the defect was
+    invisible to kea-dhcp4/6 -t. Verified empirically against Kea 2.4.1
+    with live DHCPDISCOVER/OFFER capture: pre-fix wire bytes
+    01 06 81 04 c0 a8 2c 06, post-fix 81 04 c0 a8 2c 06.
+  * Kea backend now emits typed option-defs for each O-RAN sub-option code
+    in use (0x01 ca-server-ip, 0x03 ca-port, 0x04 uri-path, 0x05 subject-dn,
+    0x06 app-protocol, 0x81 netconf-server-ip, 0x82 mplane-fqdn,
+    0x86 netconf-mode) and per-class typed option-data. Kea builds the
+    TLVs; wire bytes match ISC output byte-for-byte (verified for simple
+    SSH, simple TLS, and full CA/RA chains).
+  * DHCPv6: explicit vendor-opts (option 17) container with enterprise id
+    forced via always-send, guaranteeing emission independent of client ORO.
+  * NEW: generation-time cross-check. Structured (Kea) sub-options are
+    re-encoded to raw bytes and compared against the ISC chunk builders'
+    output for every class/family; any divergence aborts generation.
+  * Commas in string sub-option values are escaped for Kea option-data.
+  * ISC output unchanged byte-for-byte except the version line.
+
+ -- labuser <labuser@dhcp-server>  Fri, 21 Aug 2026 18:20:00 +0000
+
+oran-dhcp-gen (2.2.2) stable; urgency=low
+
+  * Multi-line ISC TLV emission. Vendor option chains with 3 or more
+    sub-options now render with each sub-option on its own continuation
+    line (matching the visual structure of pre-2.2.0 hand-edited
+    dhcpd.conf / dhcpd6.conf files). Chains with 1 or 2 sub-options
+    remain single-line. ISC dhcpd accepts both forms identically; this
+    is a presentation change only — wire bytes are unchanged.
+  * Refactored TLV builders to operate on per-sub-option byte chunks
+    rather than flat byte strings. Kea backend continues to receive
+    flat bytes via b''.join(chunks) (no behavioural change for Kea).
+
+ -- labuser <labuser@dhcp-server>  Mon, 04 May 2026 18:30:00 +0000
+
+oran-dhcp-gen (2.2.1) stable; urgency=medium
+
+  * FIX: O-RAN sub-option 0x86 (call-home protocol) byte now auto-derived
+    from class.protocol, per O-RAN WG4 M-Plane R004 §6.2.5:
+      tls -> byte 0x01 (NETCONF/TLS)
+      ssh -> byte 0x00 (NETCONF/SSH) [or omitted, both equivalent]
+    Previous 2.2.0 emitted 0x00 for TLS classes by default — this was
+    standards-non-compliant (signalled NETCONF/SSH for a TLS bootstrap)
+    and was inherited from a stale value in pre-2.2.0 hand-edited configs.
+  * DEPRECATED: ca_ra_profiles[].netconf_mode_byte. Field accepted as an
+    override but emits a warning. Remove it to use the spec-compliant
+    auto-derived value.
+
+ -- labuser <labuser@dhcp-server>  Mon, 04 May 2026 18:00:00 +0000
+
+oran-dhcp-gen (2.2.0) stable; urgency=low
+
+  * NEW: lease_profiles top-level section. Define a named lease parameter
+    set once (default_lease_time, max_lease_time, preferred_lifetime,
+    renewal_time, rebinding_time) and reference it from any class via
+    `lease_profile: <name>`.
+  * NEW: ca_ra_profiles top-level section. Define a named TLS CA/RA
+    bootstrap set once (ca_server_ipv4/v6, uri_path, subject_dn,
+    app_protocol, netconf_mode_byte) and reference it from a class via
+    `ca_ra: { profile: <name>, port: <N>, mplane_fqdn: ..., ... }`.
+  * NEW: per-class ipv4_range and ipv6_range are now BOTH optional. Omit
+    a range to disable that family for that class. At least one must be
+    present.
+  * NEW: shared pool emission. When two or more classes have identical
+    ipv4_range/ipv6_range, the generator emits one pool block with multiple
+    `allow members of "<class>";` statements (matches ISC idiom).
+  * FIX: lease parameters now emitted at POOL scope (subnet/pool) where
+    they actually take effect in ISC DHCP. The previous practice of placing
+    `max-lease-time` / `preferred-lifetime` inside class blocks was a silent
+    no-op. T1/T2 (option dhcp-renewal-time, dhcp-rebinding-time) remain at
+    class scope where DHCP options correctly inherit through class membership.
+  * Generated dhcpd.conf, dhcpd6.conf, kea-dhcp4.conf, kea-dhcp6.conf are
+    wire-byte equivalent to the v2.1.x output for any existing v2.1.x YAML
+    that does not use the new lease_profiles or ca_ra_profiles features.
+
+ -- labuser <labuser@dhcp-server>  Mon, 04 May 2026 00:00:00 +0000
+
+oran-dhcp-gen (2.1.1) stable; urgency=low
+
+  * Fixed Kea-2.4 schema bugs: user-context (replaces _comment),
+    output_options (underscore form), explicit subnet ids, typed option-defs
+    (no double-wrapping)
+
+ -- labuser <labuser@dhcp-server>  Sat, 21 Mar 2026 00:00:00 +0000
+
+oran-dhcp-gen (2.1.0) stable; urgency=low
+
+  * Added --deploy flag: deploys generated configs to system paths
+    with timestamped backup of any existing files
+  * Added --restart flag: restarts DHCP services after successful deploy
+  * --deploy uses a temp directory automatically if --outdir not specified
+  * Deploy aborts with clear error if permission denied (suggests sudo)
+
+ -- labuser <labuser@dhcp-server>  Fri, 20 Mar 2026 00:00:00 +0000
+
+oran-dhcp-gen (2.0.0) stable; urgency=low
+
+  * Added Kea DHCP output target (kea-dhcp4.conf, kea-dhcp6.conf)
+
+ -- labuser <labuser@dhcp-server>  Thu, 19 Mar 2026 00:00:00 +0000
+
+oran-dhcp-gen (1.1.0) stable; urgency=low
+
+  * Added isc-dhcp-server defaults file generation
+
+ -- labuser <labuser@dhcp-server>  Thu, 19 Mar 2026 00:00:00 +0000
+
+oran-dhcp-gen (1.0.0) stable; urgency=low
+
+  * Initial release
+
+ -- labuser <labuser@dhcp-server>  Thu, 19 Mar 2026 00:00:00 +0000
