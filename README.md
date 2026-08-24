@@ -18,7 +18,7 @@ Current version: **2.2.3** · Python 3, no dependencies beyond `python3-yaml`.
 | `pkg/usr/local/bin/oran-dhcp-gen` | The generator — a single ~1250-line Python script. **Edit this.** |
 | `pkg/usr/share/oran-dhcp-gen/oran_dhcp.yaml.example` | Full 2.2.x data model, including `lease_profiles` and `ca_ra_profiles` |
 | `pkg/` (rest) | Debian package layout — `DEBIAN/control`, man page, changelog |
-| `References/ORAN_DHCP_USER_GUIDE.md` | User guide. **Documents v2.0.0 and lags the code** — see below |
+| `References/ORAN_DHCP_USER_GUIDE.md` | User guide (v4.0.0) — full CLI, YAML model, and troubleshooting reference for v2.2.3 |
 | `References/oran-dhcp-gen_2_2_3_all.deb` | The shipped package `pkg/` was extracted from |
 | `References/isc/Lab03/` | Hand-written ISC configs from a real lab, predating the generator |
 | `References/kea/Lab4/` | A working `oran_dhcp.yaml` plus the Kea configs generated from it |
@@ -74,9 +74,10 @@ went unnoticed until it was found and fixed.
 
 ## Notes before you change anything
 
-- **The user guide lags the code.** It describes v2.0.0; v2.2.3 adds `lease_profiles`,
-  `ca_ra_profiles`, optional per-class `ipv4_range`/`ipv6_range`, `--deploy` and `--restart`.
-  Trust the script and the packaged changelog over the guide.
+- **Keep the docs in sync with the script.** The user guide is current as of v2.2.3; the
+  bundled man page is still stamped 2.2.2. A behaviour change should land alongside the guide,
+  the man page, and `changelog.gz` — the guide had drifted two minor versions before, which is
+  how the whole 2.2.x feature set went undocumented.
 - **The vendor options are built twice** — as raw bytes for ISC, and as structured
   sub-options for Kea to encode itself. `resolve_suboptions()` re-encodes the structured form
   and aborts generation if it does not match the ISC bytes exactly. Change one representation

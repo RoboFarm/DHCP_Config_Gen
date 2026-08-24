@@ -1,8 +1,8 @@
 # O-RAN DHCP Tools — User Guide
 
-**Version:** 3.0.0
-**Last Updated:** 2026-03-19
-**Packages Covered:** `oran-dhcp-gen` v2.0.0 · `dhcp-lease-list` v1.3.0
+**Version:** 4.0.0
+**Last Updated:** 2026-08-24
+**Packages Covered:** `oran-dhcp-gen` v2.2.3 · `dhcp-lease-list` v1.3.0
 
 ---
 
@@ -15,10 +15,18 @@
    - [Quick Start](#quick-start)
    - [CLI Reference](#cli-reference)
    - [YAML Data Model Reference](#yaml-data-model-reference)
+     - [global](#global--global-settings)
+     - [controllers](#controllers--o-ru-controller-definitions)
+     - [lease_profiles](#lease_profiles--reusable-lease-parameter-sets)
+     - [ca_ra_profiles](#ca_ra_profiles--tls-cara-bootstrap-settings)
+     - [oru_classes](#oru_classes--o-ru-class-definitions)
+     - [subnets](#subnets--network-configuration)
+   - [Vendor Option Encoding](#vendor-option-encoding)
    - [Generated Output Files](#generated-output-files)
    - [ISC DHCP vs Kea DHCP — Config Translation](#isc-dhcp-vs-kea-dhcp--config-translation)
-   - [Deploying ISC DHCP](#deploying-isc-dhcp)
-   - [Deploying Kea DHCP](#deploying-kea-dhcp)
+   - [Deploying with --deploy](#deploying-with---deploy)
+   - [Deploying ISC DHCP Manually](#deploying-isc-dhcp-manually)
+   - [Deploying Kea DHCP Manually](#deploying-kea-dhcp-manually)
 5. [dhcp-lease-list — Lease Viewer](#dhcp-lease-list)
    - [Quick Start](#quick-start-1)
    - [CLI Reference](#cli-reference-1)
@@ -36,7 +44,7 @@
 
 This toolset simplifies deployment and monitoring of DHCP services for O-RAN O-RU (Radio Unit) M-Plane discovery. It addresses two key operational needs:
 
-**Configuration management** — a single YAML data model (`oran_dhcp.yaml`) generates all DHCP config files for both ISC DHCP and Kea DHCP. Change a controller IP or add a new O-RU model in one place and regenerate — no manual config editing.
+**Configuration management** — a single YAML data model (`oran_dhcp.yaml`) generates all DHCP config files for both ISC DHCP and Kea DHCP. Change a controller IP or add a new O-RU model in one place and regenerate — no manual config editing. Reusable `lease_profiles` and `ca_ra_profiles` keep repeated settings in one place, and `--deploy` rolls the result out with timestamped backups.
 
 **Lease visibility** — a unified lease viewer (`dhcp-lease-list`) displays both IPv4 and IPv6 active leases in one command, supporting both ISC DHCP lease files and Kea DHCP CSV files, with automatic MAC address extraction from DHCPv6 DUIDs.
 
@@ -46,7 +54,7 @@ This toolset simplifies deployment and monitoring of DHCP services for O-RAN O-R
 
 | Package | Version | Binary | Purpose |
 |---------|---------|--------|---------|
-| `oran-dhcp-gen` | 2.0.0 | `oran-dhcp-gen` | Generate ISC and Kea DHCP configs from YAML |
+| `oran-dhcp-gen` | 2.2.3 | `oran-dhcp-gen` | Generate ISC and Kea DHCP configs from YAML |
 | `dhcp-lease-list` | 1.3.0 | `dhcp-lease-list` | View IPv4 + IPv6 leases for ISC and Kea DHCP |
 
 ---
@@ -56,8 +64,8 @@ This toolset simplifies deployment and monitoring of DHCP services for O-RAN O-R
 Both packages are `.deb` files. Install with `apt` for automatic dependency handling.
 
 ```bash
-# Install config generator (requires python3, python3-yaml)
-sudo apt install ./oran-dhcp-gen_2.0.0_all.deb
+# Install config generator (requires python3 >= 3.6, python3-yaml)
+sudo apt install ./oran-dhcp-gen_2_2_3_all.deb
 
 # Install lease viewer (requires python3)
 sudo apt install ./dhcp-lease-list_1.3.0_all.deb
@@ -65,7 +73,7 @@ sudo apt install ./dhcp-lease-list_1.3.0_all.deb
 
 **Verify:**
 ```bash
-oran-dhcp-gen --version   # oran-dhcp-gen 2.0.0
+oran-dhcp-gen --version   # oran-dhcp-gen 2.2.3
 dhcp-lease-list --version # dhcp-lease-list 1.3.0
 ```
 
@@ -90,10 +98,13 @@ cp /usr/share/oran-dhcp-gen/oran_dhcp.yaml.example ~/oran_dhcp.yaml
 # 2. Edit to match your environment
 nano ~/oran_dhcp.yaml
 
-# 3. Generate configs — choose your target
+# 3a. Generate to a directory and review before touching the live server
 oran-dhcp-gen ~/oran_dhcp.yaml --target isc --outdir /tmp/out/   # ISC DHCP
 oran-dhcp-gen ~/oran_dhcp.yaml --target kea --outdir /tmp/out/   # Kea DHCP
 oran-dhcp-gen ~/oran_dhcp.yaml --target all --outdir /tmp/out/   # Both at once
+
+# 3b. Or generate, back up, install and restart in one step
+sudo oran-dhcp-gen ~/oran_dhcp.yaml --target kea --deploy --restart
 ```
 
 ### CLI Reference
@@ -106,7 +117,13 @@ Arguments:
 
 Options:
   --target {isc,kea,all}   Output target (default: isc)
-  --outdir DIR             Output directory (default: current dir)
+  --outdir DIR             Output directory
+                           (default: a temp dir when --deploy is used,
+                            the current directory otherwise)
+  --deploy                 Copy generated files to their system paths,
+                           backing up anything already there
+  --restart                Restart the DHCP service(s) after a successful
+                           deploy. Requires --deploy
   --version                Show version and exit
   --help                   Show help
 ```
@@ -122,15 +139,28 @@ oran-dhcp-gen oran_dhcp.yaml --target kea --outdir /tmp/kea-out/
 # Generate all 5 files at once
 oran-dhcp-gen oran_dhcp.yaml --target all --outdir /tmp/all-out/
 
-# Validate YAML without deploying (review stdout for errors)
-oran-dhcp-gen oran_dhcp.yaml --target isc --outdir /tmp/test/
+# Validate the YAML without writing anywhere permanent
+oran-dhcp-gen oran_dhcp.yaml --target all --outdir /tmp/test/
+
+# Full production rollout, both servers
+sudo oran-dhcp-gen oran_dhcp.yaml --target all --deploy --restart
 ```
+
+Validation runs before anything is written. On success the generator prints a summary line:
+
+```
+[OK] Validation passed — 11 O-RU classes, 1 controllers, 1 lease profiles, 1 ca_ra profiles
+```
+
+Any validation failure prints `[ERROR] ...` and exits with status 1 **without generating partial output**.
 
 ---
 
 ### YAML Data Model Reference
 
 `oran_dhcp.yaml` is the **single source of truth** — never edit generated files directly.
+
+Top-level sections: `global`, `controllers`, `lease_profiles` (optional), `ca_ra_profiles` (optional), `oru_classes`, `subnets`.
 
 #### `global` — Global Settings
 
@@ -140,6 +170,8 @@ global:
   max_lease_time: 86400          # Maximum lease duration (24 hours)
   oran_enterprise_id: 53148      # O-RAN Alliance IANA enterprise ID (do not change)
 ```
+
+All three fields are required. They apply to every class that does **not** reference a `lease_profile`.
 
 #### `controllers` — O-RU Controller Definitions
 
@@ -152,16 +184,76 @@ controllers:
     ipv4: "192.168.36.249"       # Encoded into DHCPv4 option 43 TLV (0x81)
     ipv6: "fd00:8b36:f2a9::24:dc"  # Encoded into DHCPv6 option 17 TLV (0x0081)
 
-  - name: ctrl_att
-    description: "ATT-specific controller"
-    ipv4: "192.168.36.220"
-    ipv6: "fd00:8b36:f2a9::24:dc"
-
   - name: ctrl_lab
     description: "Lab test controller"
     ipv4: "10.0.0.1"
     ipv6: "fd00:dead:beef::1"
 ```
+
+`name`, `ipv4` and `ipv6` are all required — **both address families, even if a class only uses one.**
+
+> **Keep the two families consistent.** If two controller entries describe the same physical node, give them the same IPv4 *and* the same IPv6. A v6 address that silently disagrees with its v4 partner produces no diff at all in the IPv4 output, so the mistake surfaces only as O-RUs that lease an address and then never call home.
+
+#### `lease_profiles` — Reusable Lease Parameter Sets
+
+*(optional; new in 2.2.0)*
+
+A named set of lease timers that classes can share. Referenced from a class with `lease_profile: <name>`. Classes without a `lease_profile` use the `global` timers.
+
+```yaml
+lease_profiles:
+  bringup:
+    description: "Short lease during bring-up — fast reclaim of stale state."
+    default_lease_time:  140
+    max_lease_time:      150
+    preferred_lifetime:  140    # IPv6 only; ignored for IPv4
+    renewal_time:         60    # T1 — emitted as option dhcp-renewal-time
+    rebinding_time:      120    # T2 — emitted as option dhcp-rebinding-time
+```
+
+Every field is optional; only what you set is emitted.
+
+**Where each value lands** — this split is deliberate, because ISC DHCP ignores lease *times* declared at class scope:
+
+| Field | ISC DHCP | Kea DHCP |
+|---|---|---|
+| `default_lease_time` | `default-lease-time` inside `pool {}` / `pool6 {}` | `valid-lifetime` on the client class |
+| `max_lease_time` | `max-lease-time` inside the pool | `max-valid-lifetime` on the client class |
+| `preferred_lifetime` | `preferred-lifetime` inside `pool6 {}` | `preferred-lifetime` on the client class |
+| `renewal_time` (T1) | `option dhcp-renewal-time` inside the `class {}` block | *(not emitted)* |
+| `rebinding_time` (T2) | `option dhcp-rebinding-time` inside the `class {}` block | *(not emitted)* |
+
+If two classes share an IP range but reference *different* lease profiles, the pool can only carry one set of timers. The generator warns and uses the profile of the first member:
+
+```
+[WARN] Pool fd00:8b36:f2a9::150-159 contains classes with different lease_profiles; using profile from 'ATTn25n66-DC'
+```
+
+#### `ca_ra_profiles` — TLS CA/RA Bootstrap Settings
+
+*(optional; new in 2.2.0)*
+
+Captures the parts of a TLS certificate-enrolment payload that are identical across classes. Referenced from a class with a `ca_ra:` block. **Only takes effect when the class sets `protocol: tls`** — with `protocol: ssh` the generator warns and ignores the block.
+
+```yaml
+ca_ra_profiles:
+  att_common:
+    description: "SPM CA — shared across all TLS classes"
+    ca_server_ipv4:    "192.168.36.240"            # sub-option 0x01 (IPv4 output)
+    ca_server_ipv6:    "fd00:8b36:f2a9::95:240"    # sub-option 0x01 (IPv6 output)
+    uri_path:          "/pkix/"                    # sub-option 0x04
+    subject_dn:        "/OU=SPM/O=1Finity/C=US/CN=ATT-SSL/L=WV/ST=Texas"  # 0x05
+    app_protocol:      "http"                      # sub-option 0x06
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `ca_server_ipv4` | One of the two | Required to emit IPv4 sub-options for a class using this profile |
+| `ca_server_ipv6` | One of the two | Required to emit IPv6 sub-options |
+| `uri_path` | Yes | Enrolment URI path |
+| `subject_dn` | Yes | Certificate subject DN |
+| `app_protocol` | Yes | e.g. `http` |
+| `netconf_mode_byte` | No | **Deprecated in 2.2.1.** The 0x86 byte is now derived from the class `protocol`. Setting it still overrides, but the generator warns |
 
 #### `oru_classes` — O-RU Class Definitions
 
@@ -179,6 +271,21 @@ oru_classes:
     ipv6_range: "fd00:8b36:f2a9::110-119"  # Format: prefix::start-end
     options:                               # Optional per-class overrides
       interface_mtu: 1440                  # Sets DHCP option 26
+
+  # IPv6-only TLS class with certificate enrolment
+  - name: ATTn77
+    description: "ATT n77 RU (44R14 series) — TLS bootstrap, IPv6-only"
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    controller: ctrl_primary
+    protocol: tls
+    lease_profile: bringup                 # Reference into lease_profiles
+    # ipv4_range omitted — this class is not served on IPv4 at all
+    ipv6_range: "fd00:8b36:f2a9::130-149"
+    ca_ra:
+      profile: att_common                  # Reference into ca_ra_profiles
+      port: 8093                           # Per-class CA port (sub-option 0x03)
+      mplane_fqdn: "mplane.local"          # Optional (sub-option 0x82)
+      include_controller_ip: false         # Optional, default true (sub-option 0x81)
 
   # Catch-all — always keep this last
   - name: Unmatched
@@ -198,16 +305,29 @@ oru_classes:
 | `match_prefix` | Yes | Vendor-class-identifier prefix. `""` = catch-all |
 | `controller` | Yes | Must match a `name` in the `controllers` list |
 | `protocol` | Yes | `ssh` or `tls` |
-| `ipv4_range` | Yes | Both IPv4 and IPv6 are required |
-| `ipv6_range` | Yes | Both IPv4 and IPv6 are required |
-| `options.interface_mtu` | No | Sets DHCP option 26 (MTU) |
+| `ipv4_range` | **Optional since 2.2.0** | Omit to disable IPv4 for this class — no v4 class block, no v4 pool |
+| `ipv6_range` | **Optional since 2.2.0** | Omit to disable IPv6 for this class. **At least one range must be present** |
+| `lease_profile` | No | Name from `lease_profiles` |
+| `ca_ra` | No | CA/RA block; requires `profile` and `port`. Ignored unless `protocol: tls` |
+| `ca_ra.mplane_fqdn` | No | Emits sub-option 0x82 |
+| `ca_ra.include_controller_ip` | No | Default `true`; set `false` to omit sub-option 0x81 |
+| `options.interface_mtu` | No | Sets DHCP option 26 (MTU), IPv4 only |
 
-**Protocol TLV encoding:**
+**Shared pools.** Two or more classes that declare the *byte-identical* range string share one pool. ISC emits a single pool with one `allow members of` per class:
 
-| Protocol | DHCPv4 option 43 | DHCPv6 option 17 |
-|----------|-----------------|-----------------|
-| `ssh` | `81:04:<IPv4>` | `00:81:00:10:<IPv6>` |
-| `tls` | `81:04:<IPv4>:86:01:01` | `00:81:00:10:<IPv6>:00:86:00:01:01` |
+```
+    # Shared pool: ATTn25n66-DC, ATTn25n66-AC
+    pool6 {
+        allow members of "ATTn25n66-DC";
+        allow members of "ATTn25n66-AC";
+        range6 fd00:8b36:f2a9::150 fd00:8b36:f2a9::159;
+        default-lease-time 140;
+        max-lease-time 150;
+        preferred-lifetime 140;
+    }
+```
+
+Kea has no equivalent of multiple `allow members of` on one pool, so the generator emits **one pool entry per member class with the same range**. Overlapping pool definitions are accepted by some Kea versions and rejected by others — run `kea-dhcp6 -t` before relying on a shared range.
 
 #### `subnets` — Network Configuration
 
@@ -227,6 +347,59 @@ subnets:
       interface: "ens20.201"
 ```
 
+Both `subnets.ipv4` and `subnets.ipv6` are required, even if every class disables one family. `interface` is required on each entry — it populates `INTERFACESv4` / `INTERFACESv6` in the ISC defaults file and `interfaces-config` in the Kea configs. `gateway` and `dns_servers` are optional and are simply omitted from the output when absent.
+
+---
+
+### Vendor Option Encoding
+
+Sub-option codes are the same for both families. Only the header differs: DHCPv4 uses a 1-byte code + 1-byte length, DHCPv6 uses a 2-byte code + 2-byte length.
+
+| Code | Field | Type | Source |
+|---|---|---|---|
+| `0x01` | CA server IP | address | `ca_ra_profile.ca_server_ipv4` / `ca_server_ipv6` |
+| `0x03` | CA port | uint16 | `class.ca_ra.port` |
+| `0x04` | URI path | string | `ca_ra_profile.uri_path` |
+| `0x05` | Subject DN | string | `ca_ra_profile.subject_dn` |
+| `0x06` | App protocol | string | `ca_ra_profile.app_protocol` |
+| `0x81` | NETCONF controller IP | address | `class.controller` |
+| `0x82` | M-Plane FQDN | string | `class.ca_ra.mplane_fqdn` |
+| `0x86` | Call-home mode | uint8 | Derived from `class.protocol`: `0x01` = TLS, `0x00` = SSH |
+
+**Simple form** — a class with no `ca_ra` block emits only 0x81, plus 0x86 when `protocol: tls`:
+
+| Protocol | DHCPv4 option 43 | DHCPv6 option 17 |
+|----------|-----------------|-----------------|
+| `ssh` | `81:04:<IPv4>` | `00:81:00:10:<IPv6>` |
+| `tls` | `81:04:<IPv4>:86:01:01` | `00:81:00:10:<IPv6>:00:86:00:01:01` |
+
+**CA/RA form** — a `protocol: tls` class with a `ca_ra` block emits the full chain in code order: 0x01, 0x03, 0x04, 0x05, 0x06, then 0x81 (unless `include_controller_ip: false`), 0x82 (if `mplane_fqdn` set), and 0x86 last.
+
+Chains of three or more sub-options are emitted across multiple lines in the ISC configs, one sub-option per line. This is a readability change only — ISC `dhcpd` parses both forms identically and the wire bytes are the same:
+
+```
+class "ATTn77" {
+    match if substring(option dhcp6.vendor-class, 6, 18) = "o-ran-ru2/FJ/44R14";
+    log (info, "Matched ATTn77 class");
+    # Controller: att (fd00:8b36:f2a9::24:dc) protocol: tls
+    option dhcp6.vendor-opts 53148 00:01:00:10:fd:00:8b:36:f2:a9:00:00:00:00:00:00:00:95:02:40
+    :00:03:00:02:1f:9d
+    :00:04:00:06:2f:70:6b:69:78:2f
+    :00:05:00:2f:2f:4f:55:3d:53:50:4d:2f:4f:3d:31:46:69:6e:69:74:79:2f:43:3d:55:53:2f:43:4e:3d:41:54:54:2d:53:53:4c:2f:4c:3d:57:56:2f:53:54:3d:54:65:78:61:73
+    :00:06:00:04:68:74:74:70
+    :00:82:00:0c:6d:70:6c:61:6e:65:2e:6c:6f:63:61:6c
+    :00:86:00:01:01;
+    option dhcp-renewal-time 60;
+    option dhcp-rebinding-time 120;
+}
+```
+
+**Both backends are checked against each other at generation time.** The Kea path describes each sub-option to Kea as a typed `option-def` and lets Kea build the TLVs; the ISC path builds the bytes directly. Before emitting anything, the generator re-encodes the Kea representation to raw bytes and compares it to the ISC bytes for every class and family. A mismatch aborts generation:
+
+```
+[ERROR] internal: structured sub-options for class 'ATTn77' (ipv6) re-encode to ... but ISC builders produce ... — generator bug, refusing to emit divergent configs
+```
+
 ---
 
 ### Generated Output Files
@@ -239,7 +412,17 @@ subnets:
 | Kea | `kea-dhcp4.conf` | `/etc/kea/kea-dhcp4.conf` | Kea DHCPv4 config (JSON) |
 | Kea | `kea-dhcp6.conf` | `/etc/kea/kea-dhcp6.conf` | Kea DHCPv6 config (JSON) |
 
-All generated files embed a header comment with the generator version, timestamp, and source YAML filename.
+Every generated file records the generator version, a timestamp, and the source YAML — as comment lines in the ISC files, and as a `user-context` object in the Kea JSON:
+
+```json
+"user-context": {
+    "comment": "Generated by oran-dhcp-gen v2.2.3 on 2026-08-21 19:11",
+    "source": "oran_dhcp.yaml",
+    "warning": "DO NOT EDIT MANUALLY"
+}
+```
+
+Kea leases are written to `/var/lib/kea/kea-leases4.csv` and `/var/lib/kea/kea-leases6.csv`, and Kea logs to `/var/log/kea/kea-dhcp4.log` and `kea-dhcp6.log` at `INFO` severity.
 
 ---
 
@@ -249,19 +432,57 @@ The same `oran_dhcp.yaml` generates both formats. Here is how key concepts map:
 
 | YAML concept | ISC DHCP | Kea DHCP |
 |-------------|----------|----------|
-| `match_prefix` | `substring(vendor-class-identifier, 0, N) = "..."` | `substring(option[60].hex, 0, N) == '...'` (v4) |
-| DHCPv6 class match | `substring(dhcp6.vendor-class, 6, N)` | `substring(vendor-class[53148].data[0], 0, N)` |
-| `ipv4_range` | `range A B` inside `pool {}` | `"pool": "A - B"` with `client-class` field |
-| `ipv6_range` | `range6 A B` inside `pool6 {}` | `"pool": "A - B"` with `client-class` field |
-| `protocol: ssh` | `81:04:<IP>` in option 43 | Binary sub-option 129 in vendor space |
-| `protocol: tls` | `81:04:<IP>:86:01:01` | Binary sub-option 129 with TLS flag appended |
+| `match_prefix` (v4) | `substring(option vendor-class-identifier, 0, N) = "..."` | `substring(option[60].hex, 0, N) == '...'` |
+| `match_prefix` (v6) | `substring(option dhcp6.vendor-class, 6, N) = "..."` | `substring(vendor-class[53148].data[0], 0, N) == '...'` |
+| `ipv4_range` | `range A B` inside `pool {}` | `"pool": "A - B"` with `client-class` |
+| `ipv6_range` | `range6 A B` inside `pool6 {}` | `"pool": "A - B"` with `client-class` |
+| Shared range | one pool, several `allow members of` | one pool entry per class, same range |
+| Vendor options | hex byte string on `option vendor-encapsulated-options` / `dhcp6.vendor-opts` | typed `option-def` + `option-data` per sub-option; **Kea** encodes the TLVs |
+| DHCPv6 option 17 container | `option dhcp6.vendor-opts <eid> <hex>` | `vendor-opts` option-data carrying the enterprise ID, `always-send: true` |
+| `lease_profile` times | `default-lease-time` / `max-lease-time` / `preferred-lifetime` at pool scope | `valid-lifetime` / `max-valid-lifetime` / `preferred-lifetime` on the client class |
+| `lease_profile` T1/T2 | `option dhcp-renewal-time` / `dhcp-rebinding-time` in the class block | not emitted |
 | Catch-all class | `match if substring(...) = ""` | `not member('A') and not member('B') ...` |
+| Omitted `ipv4_range` | class and pool absent from `dhcpd.conf` | class and pool absent from `kea-dhcp4.conf` |
 | Config format | Plain text | JSON |
 | Lease storage | `/var/lib/dhcp/dhcpd.leases` | `/var/lib/kea/kea-leases4.csv` |
 
+> **Kea vendor options must be typed, not pre-encoded.** Any binary blob placed in a Kea vendor space is wrapped by Kea in *that sub-option's* own TLV header. Versions 2.2.0–2.2.2 emitted the whole payload under sub-option `0x01` and so put `01 LL 81 04 ...` on the wire instead of a bare `81 04 ...`; O-RUs skipped the unrecognised sub-option and never learned the controller address, while `kea-dhcp4 -t` still reported the config valid. Fixed in 2.2.3.
+
 ---
 
-### Deploying ISC DHCP
+### Deploying with --deploy
+
+`--deploy` writes each generated file to its system path, backing up whatever is already there. `--restart` then restarts the services for the chosen target. Both need root.
+
+```bash
+# ISC: generate to a temp dir, back up, install, restart both v4 and v6
+sudo oran-dhcp-gen ~/oran_dhcp.yaml --target isc --deploy --restart
+
+# Kea, keeping a copy of the generated files for review
+sudo oran-dhcp-gen ~/oran_dhcp.yaml --target kea --outdir /tmp/kea-out/ --deploy
+
+# Everything, both servers
+sudo oran-dhcp-gen ~/oran_dhcp.yaml --target all --deploy --restart
+```
+
+Backups are named `<file>.bak.YYYYMMDD-HHMMSS`, for example `/etc/dhcp/dhcpd.conf.bak.20260504-143022`. A file that did not exist before is reported as `(new file)` with no backup.
+
+`--restart` runs `systemctl restart` for the services matching `--target`:
+
+| Target | Services restarted |
+|---|---|
+| `isc` | `isc-dhcp-server`, `isc-dhcp-server6` |
+| `kea` | `kea-dhcp4-server`, `kea-dhcp6-server` |
+| `all` | all four |
+
+Two safety properties worth knowing:
+
+- `--restart` without `--deploy` is rejected: `[ERROR] --restart requires --deploy to be specified`.
+- If any file fails to deploy, the run reports `[WARN] Deploy completed with errors` and **skips the restart**, leaving the running server on its previous config.
+
+`--deploy` does *not* run `dhcpd -t` or `kea-dhcp4 -t` for you. For a change to a live network, prefer generating to a directory, validating, and then deploying — as below.
+
+### Deploying ISC DHCP Manually
 
 ```bash
 # Generate
@@ -271,21 +492,21 @@ oran-dhcp-gen ~/oran_dhcp.yaml --target isc --outdir /tmp/dhcp-out/
 diff /tmp/dhcp-out/dhcpd.conf /etc/dhcp/dhcpd.conf
 diff /tmp/dhcp-out/dhcpd6.conf /etc/dhcp/dhcpd6.conf
 
+# Validate syntax before installing
+sudo dhcpd -t -cf /tmp/dhcp-out/dhcpd.conf
+sudo dhcpd -6 -t -cf /tmp/dhcp-out/dhcpd6.conf
+
 # Deploy
 sudo cp /tmp/dhcp-out/dhcpd.conf      /etc/dhcp/dhcpd.conf
 sudo cp /tmp/dhcp-out/dhcpd6.conf     /etc/dhcp/dhcpd6.conf
 sudo cp /tmp/dhcp-out/isc-dhcp-server /etc/default/isc-dhcp-server
-
-# Validate syntax
-sudo dhcpd -t -cf /etc/dhcp/dhcpd.conf
-sudo dhcpd -6 -t -cf /etc/dhcp/dhcpd6.conf
 
 # Restart
 sudo systemctl restart isc-dhcp-server
 sudo systemctl restart isc-dhcp-server6
 ```
 
-### Deploying Kea DHCP
+### Deploying Kea DHCP Manually
 
 ```bash
 # Install Kea if not already present
@@ -298,13 +519,13 @@ oran-dhcp-gen ~/oran_dhcp.yaml --target kea --outdir /tmp/kea-out/
 diff /tmp/kea-out/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
 diff /tmp/kea-out/kea-dhcp6.conf /etc/kea/kea-dhcp6.conf
 
+# Validate syntax before installing
+kea-dhcp4 -t /tmp/kea-out/kea-dhcp4.conf
+kea-dhcp6 -t /tmp/kea-out/kea-dhcp6.conf
+
 # Deploy
 sudo cp /tmp/kea-out/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
 sudo cp /tmp/kea-out/kea-dhcp6.conf /etc/kea/kea-dhcp6.conf
-
-# Validate syntax
-kea-dhcp4 -t /etc/kea/kea-dhcp4.conf
-kea-dhcp6 -t /etc/kea/kea-dhcp6.conf
 
 # Restart
 sudo systemctl restart kea-dhcp4-server
@@ -479,7 +700,7 @@ The ia-na key in ISC DHCPv6 lease files contains a 4-byte IAID prefix before the
 
 O-RU M-Plane discovery follows the O-RAN Alliance WG4 M-Plane specification. On power-up, an O-RU sends a DHCP request containing its vendor-class-identifier which identifies the O-RU model and vendor. The DHCP server returns the controller IP address encoded in vendor-specific options so the O-RU knows which NETCONF controller to call home to.
 
-**DHCPv4 uses option 43** (vendor-encapsulated-options) with O-RAN TLV sub-options:
+**DHCPv4 uses option 43** (vendor-encapsulated-options) with O-RAN TLV sub-options, each a 1-byte code, 1-byte length, then value:
 
 | Sub-option | Hex | Description |
 |------------|-----|-------------|
@@ -489,7 +710,7 @@ O-RU M-Plane discovery follows the O-RAN Alliance WG4 M-Plane specification. On 
 Example option 43 for SSH: `81:04:c0:a8:24:f9`
 Example option 43 for TLS: `81:04:c0:a8:24:f9:86:01:01`
 
-**DHCPv6 uses option 17** (vendor-opts) with O-RAN enterprise ID `53148`:
+**DHCPv6 uses option 17** (vendor-opts) with O-RAN enterprise ID `53148`. The sub-option header is wider — 2-byte code, 2-byte length:
 
 | Sub-option | Hex | Description |
 |------------|-----|-------------|
@@ -502,6 +723,10 @@ Example option 17 for TLS: `00:81:00:10:<16-byte IPv6>:00:86:00:01:01`
 After receiving the controller address, the O-RU initiates a NETCONF call-home session:
 - SSH: TCP port 4334
 - TLS: TCP port 4335
+
+**Certificate enrolment (CA/RA).** O-RUs that bootstrap over TLS may also need to enrol for a certificate before the NETCONF session can come up. That is carried in the same vendor option as additional sub-options — CA server address (`0x01`), port (`0x03`), URI path (`0x04`), subject DN (`0x05`) and application protocol (`0x06`), optionally with an M-Plane FQDN (`0x82`). See [Vendor Option Encoding](#vendor-option-encoding) for how `ca_ra_profiles` map onto these codes.
+
+**Sub-option order and unknown codes.** An O-RU walks the sub-options in the order received and skips any code it does not recognise. It does not search for a controller address nested inside another sub-option — which is why an incorrectly wrapped payload produces a healthy-looking lease and no call-home at all.
 
 ---
 
@@ -530,6 +755,10 @@ kea-dhcp6 -t /etc/kea/kea-dhcp6.conf
 ```bash
 # See what vendor class the O-RU is actually sending
 sudo journalctl -u isc-dhcp-server | grep "Vendor Class"
+
+# The generated configs log every match, so you can also confirm which class won
+sudo journalctl -u isc-dhcp-server | grep "Matched"
+sudo journalctl -u isc-dhcp-server6 | grep "Unmatched Vendor Class String"
 ```
 
 **O-RU not matching the expected class (Kea):**
@@ -538,6 +767,32 @@ sudo journalctl -u isc-dhcp-server | grep "Vendor Class"
 # "severity": "DEBUG", "debuglevel": 55
 cat /var/log/kea/kea-dhcp4.log | grep -i "class\|vendor\|classify"
 ```
+
+**O-RU gets a lease but never calls home.** The lease is proof of DHCP working, not of the vendor option being right. Check, in order:
+
+```bash
+# 1. Which controller address did this class actually get? Read it back out of
+#    the deployed config rather than the YAML.
+grep -A3 'class "Gen1TB"' /etc/dhcp/dhcpd6.conf
+python3 -c "import json;d=json.load(open('/etc/kea/kea-dhcp6.conf'));
+print([c for c in d['Dhcp6']['client-classes'] if c['name']=='Gen1TB'])"
+
+# 2. Confirm the bytes on the wire. Sub-option 0x81 (v4) / 0x0081 (v6) must
+#    appear at the TOP level of the vendor option, not nested inside another.
+sudo tcpdump -i <mplane-if> -vvv -n port 67 or port 68     # v4
+sudo tcpdump -i <mplane-if> -vvv -n port 546 or port 547   # v6
+
+# 3. Is anything listening where you pointed the O-RU?
+ss -lntp | grep -E '4334|4335'
+```
+
+Three causes account for most of these:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Wire shows `01 LL 81 04 ...` instead of `81 04 ...` | Kea config generated by 2.2.0–2.2.2 | Regenerate with 2.2.3 or later and redeploy |
+| Controller address is wrong but plausible | `controllers[].ipv6` disagrees with its own `ipv4` — invisible in the v4 output when two controllers share an IPv4 | Fix the YAML, regenerate, and diff the **v6** output |
+| TLS O-RU never enrols | `ca_ra` block present but class is `protocol: ssh` | The generator warns and ignores it; set `protocol: tls` |
 
 **dhcp-lease-list showing no leases:**
 ```bash
@@ -570,6 +825,15 @@ echo -e "[Journal]\nSystemMaxUse=100M" | \
 sudo systemctl restart systemd-journald
 ```
 
+**Rolling back a bad deploy.** `--deploy` leaves a timestamped backup of every file it replaced:
+
+```bash
+ls -t /etc/dhcp/dhcpd.conf.bak.*        # newest first
+sudo cp /etc/dhcp/dhcpd.conf.bak.20260504-143022 /etc/dhcp/dhcpd.conf
+sudo dhcpd -t -cf /etc/dhcp/dhcpd.conf
+sudo systemctl restart isc-dhcp-server
+```
+
 **Generator validation errors:**
 
 | Error | Fix |
@@ -577,8 +841,27 @@ sudo systemctl restart systemd-journald
 | `references unknown controller: 'ctrl_xyz'` | Check `controller` field matches a `name` in `controllers` list exactly |
 | `invalid ipv4_range format: '...~...'` | Use hyphen `-` not tilde. Correct: `192.168.36.100-109` |
 | `invalid ipv6_range format` | Correct format: `fd00:8b36:f2a9::100-109` |
+| `ipv4_range start > end` | Range endpoints are in the wrong order |
+| `must have at least one of ipv4_range or ipv6_range` | A class may disable one family, not both |
 | `global.oran_enterprise_id is required` | Ensure all three `global` fields are present |
 | `Duplicate oru_class name` | Each class name must be unique |
+| `Controller missing required field: 'ipv6'` | Every controller needs `name`, `ipv4` **and** `ipv6` |
+| `references undefined lease_profile: 'x'` | The name must exist as a key under `lease_profiles` |
+| `ca_ra references undefined profile: 'x'` | The name must exist as a key under `ca_ra_profiles` |
+| `ca_ra block missing required field: 'port'` | `profile` and `port` are both required in a class `ca_ra` block |
+| `ca_ra_profile 'x' must define at least one of ca_server_ipv4 or ca_server_ipv6` | Add the address for whichever family the referencing classes serve |
+| `ca_ra_profile must define ca_server_ipv6 to emit ipv6 sub-options` | A class with an `ipv6_range` references a profile that only has the v4 CA address |
+| `subnets.ipv4 entries must include an 'interface' field` | Required to write the interface binding files |
+| `internal: structured sub-options ... refusing to emit divergent configs` | Generator bug — the ISC and Kea encoders disagree. Report it; do not work around it |
+
+**Generator warnings** (generation continues):
+
+| Warning | Meaning |
+|---|---|
+| `has ca_ra block but protocol is 'ssh' — ca_ra will be ignored` | Set `protocol: tls` to use the block |
+| `contains classes with different lease_profiles` | A shared pool can carry only one set of timers; the first member's profile wins |
+| `has classes with conflicting interface_mtu values` | Same, for MTU; the lowest-sorted value is used |
+| `sets 'netconf_mode_byte' explicitly; this field is deprecated in 2.2.1` | Remove it and let the 0x86 byte follow `class.protocol` |
 
 ---
 
@@ -588,6 +871,12 @@ sudo systemctl restart systemd-journald
 
 | Version | Changes |
 |---------|---------|
+| 2.2.3 | **Fixed Kea option 43/17 encoding** (regression from 2.2.0). Payload had been emitted as one binary blob under sub-option `0x01`, which Kea wrapped in its own TLV — O-RUs never learned the controller IP although the config validated cleanly. Kea now emits typed `option-def` / `option-data` per O-RAN sub-option and builds the TLVs itself, matching ISC wire bytes. DHCPv6 `vendor-opts` container forced with `always-send`. Added a generation-time cross-check that re-encodes the Kea representation and aborts on any divergence from the ISC bytes. Commas in string sub-option values escaped for Kea. ISC output unchanged |
+| 2.2.2 | Multi-line ISC TLV emission — chains of 3+ sub-options render one sub-option per line. Presentation only; wire bytes unchanged |
+| 2.2.1 | Sub-option `0x86` derived from `class.protocol` per O-RAN WG4 §6.2.5. `ca_ra_profiles[].netconf_mode_byte` deprecated (still honoured, now warns) |
+| 2.2.0 | Added `lease_profiles` and `ca_ra_profiles`. `ipv4_range` / `ipv6_range` became optional per class (at least one required). Shared-range pool emission. Lease times moved to pool scope, where ISC actually applies them |
+| 2.1.1 | Fixed Kea 2.4 schema bugs |
+| 2.1.0 | Added `--deploy` and `--restart` |
 | 2.0.0 | Added Kea DHCP target (`kea-dhcp4.conf`, `kea-dhcp6.conf`). `--target` now accepts `isc`, `kea`, or `all` |
 | 1.1.0 | Added `isc-dhcp-server` defaults file generation (`/etc/default/isc-dhcp-server`) |
 | 1.0.0 | Initial release — ISC DHCP IPv4 + IPv6 config generation from YAML |
