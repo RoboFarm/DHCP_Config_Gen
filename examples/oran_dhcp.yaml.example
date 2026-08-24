@@ -66,6 +66,10 @@ ca_ra_profiles:
 #                   or DHCPv6 vendor-class option 16, after the 6-byte EID
 # controller      : reference to controllers[].name
 # protocol        : ssh | tls
+# callhome_port   : OPTIONAL — NETCONF call-home port, sub-opt 0x87 / 0x0087
+#                   an integer, or 'auto' for the RFC 8071 port matching
+#                   protocol (SSH 4334, TLS 4335). Omit to emit no 0x87,
+#                   leaving the O-RU on its firmware default.
 # lease_profile   : optional reference to lease_profiles
 # ipv4_range      : OPTIONAL — omit to disable IPv4 family for this class
 # ipv6_range      : OPTIONAL — omit to disable IPv6 family for this class
@@ -125,6 +129,7 @@ oru_classes:
     match_prefix: "o-ran-ru2/FJ/N70660"
     controller: att
     protocol: ssh
+    callhome_port: 4334                 # explicit form — SSH call-home port
     ipv4_range: "192.168.36.120-129"
     ipv6_range: "fd00:8b36:f2a9::120-129"
 
@@ -133,6 +138,7 @@ oru_classes:
     match_prefix: "o-ran-ru2/FJ/44R14"
     controller: att
     protocol: tls
+    callhome_port: auto                 # -> 4335, the TLS call-home port
     lease_profile: bringup
     # ipv4_range intentionally omitted — IPv4 disabled for ATT classes
     ipv6_range: "fd00:8b36:f2a9::130-149"
@@ -147,6 +153,7 @@ oru_classes:
     match_prefix: "o-ran-ru2/FJ/44R26-N25N66-DC/"
     controller: att
     protocol: tls
+    callhome_port: auto                 # -> 4335, the TLS call-home port
     lease_profile: bringup
     ipv6_range: "fd00:8b36:f2a9::150-159"  # SHARED with ATTn25n66-AC
     ca_ra:
@@ -159,6 +166,7 @@ oru_classes:
     match_prefix: "o-ran-ru2/FJ/44R26-N25N66-AC/"
     controller: att
     protocol: tls
+    callhome_port: auto                 # -> 4335, the TLS call-home port
     lease_profile: bringup
     ipv6_range: "fd00:8b36:f2a9::160-189"  # SHARED with ATTn25n66-DC
     ca_ra:

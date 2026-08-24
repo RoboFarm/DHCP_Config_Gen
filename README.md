@@ -9,7 +9,7 @@ matches that prefix to a class and returns the NETCONF controller address in the
 vendor options — DHCPv4 **option 43** and DHCPv6 **option 17** (enterprise ID **53148**) —
 so the O-RU knows where to call home (SSH 4334 / TLS 4335).
 
-Current version: **2.3.0** · Python 3, no dependencies beyond `python3-yaml`.
+Current version: **2.4.0** · Python 3, no dependencies beyond `python3-yaml`.
 
 ## Repository layout
 
@@ -108,6 +108,11 @@ a "v2.2.3 installed" header.)
   sub-options for Kea to encode itself. `resolve_suboptions()` re-encodes the structured form
   and aborts generation if it does not match the ISC bytes exactly. Change one representation
   and you must change the other.
+- **`protocol: tls` alone does not finish the job.** Sub-option `0x86` tells the O-RU to
+  use TLS but not which port, so it falls back to its firmware default — 4334, the SSH
+  call-home port on the Fujitsu units — and the TLS listener never sees it. Set
+  `callhome_port: auto` on the class (sub-option `0x87`, NEW in 2.4.0). The field is
+  opt-in: a model that omits it emits no `0x87` and its wire bytes are unchanged.
 - Kea must emit *typed* per-sub-option data, never a pre-built blob. Versions 2.2.0–2.2.2
   nested the whole payload under sub-option `0x01`, so Kea wrapped it in its own TLV; O-RUs
   skipped the unknown code and never learned the controller IP, while `kea-dhcp4 -t` still

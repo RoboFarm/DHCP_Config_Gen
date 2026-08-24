@@ -100,7 +100,9 @@ Pipeline inside the script: `validate()` → range parsers → **TLV resolution*
 
 ## Domain rules that constrain edits
 
-- O-RU M-Plane discovery: DHCPv4 **option 43** and DHCPv6 **option 17** (O-RAN enterprise ID **53148**) carry the NETCONF controller address. Sub-options: `0x81` controller IP, `0x86` call-home mode (`01` = TLS, absent/`00` = SSH), `0x82` FQDN, and `0x01/0x03/0x04/0x05/0x06` for the CA/RA bootstrap chain. Call-home ports: SSH 4334, TLS 4335.
+- O-RU M-Plane discovery: DHCPv4 **option 43** and DHCPv6 **option 17** (O-RAN enterprise ID **53148**) carry the NETCONF controller address. Sub-options: `0x81` controller IP, `0x86` call-home mode (`01` = TLS, absent/`00` = SSH), `0x87` call-home port (uint16), `0x82` FQDN, and `0x01/0x03/0x04/0x05/0x06` for the CA/RA bootstrap chain. Call-home ports: SSH 4334, TLS 4335.
+- `0x87` is emitted only when a class sets `callhome_port` (an integer, or `auto` for the port matching `protocol`). Without it a `protocol: tls` class leaves the O-RU on its firmware default of 4334 and TLS call-home never completes — the lease looks healthy and both `dhcpd -t` and `kea-dhcp4 -t` pass, so it reads as an O-RU fault. Keeping it opt-in is what makes an upgrade byte-identical for models that do not set it; `test_callhome_port_is_opt_in` guards that.
+- Kea has no per-client-class `renew-timer`/`rebind-timer`, so a `lease_profile`'s T1/T2 go out as DHCPv4 options 58/59 in the class `option-data`, matching the ISC class block. DHCPv6 has no equivalent — T1/T2 are IA_NA fields there — so a v6 class carries lifetimes only.
 - `match_length` is **auto-derived** from `len(match_prefix)` — it is not a YAML field.
 - The catch-all class uses `match_prefix: ""` and **must be last**; ISC matches it via an empty substring, Kea via `not member(...)` of every other class.
 - Ranges use hyphens, not tildes: `192.168.44.160-169`, `fd00:8b36:f2a9::160-169`.

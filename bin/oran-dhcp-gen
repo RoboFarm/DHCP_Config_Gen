@@ -54,7 +54,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -80,6 +80,22 @@ REQUIRED_GLOBAL = ["default_lease_time", "max_lease_time", "oran_enterprise_id"]
 REQUIRED_CTRL   = ["name", "ipv4", "ipv6"]
 REQUIRED_CLASS  = ["name", "match_prefix", "controller", "protocol"]
 VALID_PROTOCOLS = ["ssh", "tls"]
+
+# IANA-registered NETCONF call-home ports (RFC 8071).  An O-RU that is told
+# "use TLS" (sub-option 0x86 = 0x01) but is not told a port falls back to its
+# firmware default, which on the Fujitsu units in the lab is 4334 -- the SSH
+# call-home port.  The TLS listener never sees the connection.  Sub-option
+# 0x87 carries the port explicitly; `callhome_port: auto` picks from here.
+CALLHOME_PORTS = {"ssh": 4334, "tls": 4335}
+
+# Keys the model understands.  Anything else is a typo or a schema that was
+# imagined but never implemented -- `tls_ca:` under a controller is the known
+# example, see validate().  Unknown keys are reported, never silently dropped.
+KNOWN_CTRL_KEYS  = {"name", "description", "ipv4", "ipv6"}
+KNOWN_CLASS_KEYS = {"name", "description", "match_prefix", "controller",
+                    "protocol", "callhome_port", "lease_profile",
+                    "ipv4_range", "ipv6_range", "ca_ra", "options"}
+KNOWN_CA_RA_KEYS = {"profile", "port", "mplane_fqdn", "include_controller_ip"}
 
 
 def die(msg):
@@ -107,6 +123,19 @@ def validate(cfg):
         for f in REQUIRED_CTRL:
             if f not in c:
                 die(f"Controller missing required field: '{f}'")
+        # 'tls_ca' was never a real field.  A commented-out block using it
+        # shipped in the Lab4 reference YAML, so uncommenting it looked like
+        # the way to turn on TLS bootstrap -- and produced a config with no
+        # CA/RA sub-options at all and no complaint.  Fail loudly instead.
+        if "tls_ca" in c:
+            die(f"Controller '{c['name']}' uses 'tls_ca', which this generator "
+                f"has never implemented. TLS CA/RA bootstrap is configured with "
+                f"a top-level 'ca_ra_profiles' entry referenced from a class via "
+                f"'ca_ra: {{ profile: <name>, port: N }}' — see the user guide.")
+        for k in c:
+            if k not in KNOWN_CTRL_KEYS:
+                warn(f"Controller '{c['name']}': unknown field '{k}' — ignored. "
+                     f"Known fields: {', '.join(sorted(KNOWN_CTRL_KEYS))}")
         controllers[c["name"]] = c
     if not controllers:
         die("At least one controller must be defined")
@@ -168,6 +197,33 @@ def validate(cfg):
         if cls["protocol"] not in VALID_PROTOCOLS:
             die(f"oru_class '{name}' protocol must be 'ssh' or 'tls', got: '{cls['protocol']}'")
 
+        for k in cls:
+            if k not in KNOWN_CLASS_KEYS:
+                warn(f"oru_class '{name}': unknown field '{k}' — ignored. "
+                     f"Known fields: {', '.join(sorted(KNOWN_CLASS_KEYS))}")
+
+        # callhome_port: int, or "auto" to take the RFC 8071 port for the
+        # class protocol.  Absent means sub-option 0x87 is not emitted at all,
+        # which is the pre-2.4.0 wire format.
+        cp = cls.get("callhome_port")
+        if cp is not None:
+            if isinstance(cp, str):
+                if cp != "auto":
+                    die(f"oru_class '{name}' callhome_port must be an integer "
+                        f"1-65535 or 'auto', got: '{cp}'")
+            elif isinstance(cp, bool) or not isinstance(cp, int):
+                die(f"oru_class '{name}' callhome_port must be an integer "
+                    f"1-65535 or 'auto', got: {cp!r}")
+            elif not 1 <= cp <= 65535:
+                die(f"oru_class '{name}' callhome_port out of range: {cp} "
+                    f"(must be 1-65535)")
+            elif cls["protocol"] == "tls" and cp == CALLHOME_PORTS["ssh"]:
+                warn(f"oru_class '{name}' is protocol: tls but sets "
+                     f"callhome_port: {cp}, the SSH call-home port. The O-RU "
+                     f"will open a TLS connection to the SSH listener. "
+                     f"Use {CALLHOME_PORTS['tls']} or 'auto' unless this is "
+                     f"deliberate.")
+
         # New: ranges are now optional (presence enables that family)
         if "ipv4_range" not in cls and "ipv6_range" not in cls:
             die(f"oru_class '{name}' must have at least one of ipv4_range or ipv6_range")
@@ -193,6 +249,11 @@ def validate(cfg):
                 die(f"oru_class '{name}' ca_ra references undefined profile: '{ca_ra['profile']}'")
             if "port" not in ca_ra:
                 die(f"oru_class '{name}' ca_ra block missing required field: 'port'")
+            for k in ca_ra:
+                if k not in KNOWN_CA_RA_KEYS:
+                    warn(f"oru_class '{name}' ca_ra: unknown field '{k}' — "
+                         f"ignored. Known fields: "
+                         f"{', '.join(sorted(KNOWN_CA_RA_KEYS))}")
 
     print(f"[OK] Validation passed — {len(classes)} O-RU classes, "
           f"{len(controllers)} controllers, "
@@ -265,19 +326,40 @@ def group_classes_by_range(classes, family):
 # format multi-line for ISC.
 # ---------------------------------------------------------------------------
 
-def build_option43_chunks_simple(ctrl_ipv4, protocol):
+def resolve_callhome_port(cls):
+    """Port for sub-option 0x87, or None when the class does not set one.
+
+    `callhome_port: auto` resolves to the RFC 8071 port for the class
+    protocol (SSH 4334, TLS 4335).  Omitting the field emits no 0x87, which
+    keeps the chain byte-identical to pre-2.4.0 output.
+    """
+    cp = cls.get("callhome_port")
+    if cp is None:
+        return None
+    if cp == "auto":
+        return CALLHOME_PORTS[cls["protocol"]]
+    return int(cp)
+
+
+def build_option43_chunks_simple(ctrl_ipv4, protocol, callhome_port=None):
     """DHCPv4 simple form — chunks per sub-option."""
     chunks = [bytes([0x81, 0x04]) + ipaddress.IPv4Address(ctrl_ipv4).packed]
     if protocol == "tls":
         chunks.append(bytes([0x86, 0x01, 0x01]))
+    if callhome_port is not None:
+        chunks.append(bytes([0x87, 0x02,
+                             (callhome_port >> 8) & 0xFF, callhome_port & 0xFF]))
     return chunks
 
 
-def build_option17_chunks_simple(ctrl_ipv6, protocol):
+def build_option17_chunks_simple(ctrl_ipv6, protocol, callhome_port=None):
     """DHCPv6 simple form — chunks per sub-option."""
     chunks = [bytes([0x00, 0x81, 0x00, 0x10]) + ipaddress.IPv6Address(ctrl_ipv6).packed]
     if protocol == "tls":
         chunks.append(bytes([0x00, 0x86, 0x00, 0x01, 0x01]))
+    if callhome_port is not None:
+        chunks.append(bytes([0x00, 0x87, 0x00, 0x02,
+                             (callhome_port >> 8) & 0xFF, callhome_port & 0xFF]))
     return chunks
 
 
@@ -299,6 +381,7 @@ def build_option17_chunks_simple(ctrl_ipv6, protocol):
 # 0x81  81:LL      00:81:LL   Controller IP         class.controller (opt-in)
 # 0x82  82:LL      00:82:LL   M-plane FQDN (str)    class.ca_ra.mplane_fqdn
 # 0x86  86:LL      00:86:LL   NETCONF mode (uint8)  ca_ra_profile (default 0x00)
+# 0x87  87:LL      00:87:LL   Call-home port (u16)  class.callhome_port (opt-in)
 # ---------------------------------------------------------------------------
 
 
@@ -317,7 +400,8 @@ def _v6_subopt(code, value_bytes):
     ]) + value_bytes
 
 
-def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol):
+def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol,
+                       callhome_port=None):
     """
     Build the full ATT-style vendor sub-option chain as a list of
     per-sub-option byte chunks (one bytes object per sub-option).
@@ -331,6 +415,8 @@ def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol):
                      per O-RAN WG4 §6.2.5 (0x00=SSH, 0x01=TLS).
                      Profile-level 'netconf_mode_byte' overrides if set
                      (deprecated escape hatch).
+      callhome_port: NETCONF call-home port for sub-opt 0x87, or None to
+                     omit it (see resolve_callhome_port).
     """
     is_v4 = (family == "ipv4")
     subopt = _v4_subopt if is_v4 else _v6_subopt
@@ -381,6 +467,11 @@ def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol):
         mode_byte = 0x01 if protocol == "tls" else 0x00
     chunks.append(subopt(0x86, bytes([mode_byte])))
 
+    # 0x87: NETCONF call-home port (optional, opt-in via class.callhome_port)
+    if callhome_port is not None:
+        chunks.append(subopt(0x87, bytes([(callhome_port >> 8) & 0xFF,
+                                          callhome_port & 0xFF])))
+
     return chunks
 
 
@@ -406,16 +497,17 @@ def resolve_tlv(family, cls, controllers, ca_ra_profiles):
     ctrl     = controllers[cls["controller"]]
     protocol = cls["protocol"]
     ca_ra    = cls.get("ca_ra")
+    port     = resolve_callhome_port(cls)
 
     if ca_ra is not None and protocol == "tls":
         profile = ca_ra_profiles[ca_ra["profile"]]
-        chunks = build_ca_ra_chunks(family, profile, ca_ra, ctrl, protocol)
+        chunks = build_ca_ra_chunks(family, profile, ca_ra, ctrl, protocol, port)
     else:
         # Simple legacy form (v2.1.x compatible)
         if family == "ipv4":
-            chunks = build_option43_chunks_simple(ctrl["ipv4"], protocol)
+            chunks = build_option43_chunks_simple(ctrl["ipv4"], protocol, port)
         else:
-            chunks = build_option17_chunks_simple(ctrl["ipv6"], protocol)
+            chunks = build_option17_chunks_simple(ctrl["ipv6"], protocol, port)
 
     raw = b"".join(chunks)
     return chunks, bytes_to_hex_str(raw), raw
@@ -444,6 +536,8 @@ KEA_SUBOPT_DEFS = {
     0x81: ("oran-netconf-server-ip", {"ipv4": "ipv4-address", "ipv6": "ipv6-address"}),
     0x82: ("oran-mplane-fqdn",       {"ipv4": "string",       "ipv6": "string"}),
     0x86: ("oran-netconf-mode",      {"ipv4": "uint8",        "ipv6": "uint8"}),
+    0x87: ("oran-netconf-callhome-port",
+                                     {"ipv4": "uint16",       "ipv6": "uint16"}),
 }
 
 
@@ -451,17 +545,20 @@ def _subopt_struct(code, kea_type, kea_data):
     return {"code": code, "type": kea_type, "data": kea_data}
 
 
-def build_subopts_simple(family, ctrl, protocol):
+def build_subopts_simple(family, ctrl, protocol, callhome_port=None):
     """Structured simple form — mirrors build_option43/17_chunks_simple."""
     ip_type = "ipv4-address" if family == "ipv4" else "ipv6-address"
     ip_key  = "ipv4" if family == "ipv4" else "ipv6"
     subs = [_subopt_struct(0x81, ip_type, ctrl[ip_key])]
     if protocol == "tls":
         subs.append(_subopt_struct(0x86, "uint8", "1"))
+    if callhome_port is not None:
+        subs.append(_subopt_struct(0x87, "uint16", str(callhome_port)))
     return subs
 
 
-def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol):
+def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol,
+                        callhome_port=None):
     """Structured full ATT-style CA/RA form — mirrors build_ca_ra_chunks."""
     is_v4   = (family == "ipv4")
     ip_type = "ipv4-address" if is_v4 else "ipv6-address"
@@ -489,6 +586,8 @@ def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol):
     else:
         mode_byte = 0x01 if protocol == "tls" else 0x00
     subs.append(_subopt_struct(0x86, "uint8", str(mode_byte)))
+    if callhome_port is not None:
+        subs.append(_subopt_struct(0x87, "uint16", str(callhome_port)))
     return subs
 
 
@@ -526,12 +625,13 @@ def resolve_suboptions(family, cls, controllers, ca_ra_profiles):
     ctrl     = controllers[cls["controller"]]
     protocol = cls["protocol"]
     ca_ra    = cls.get("ca_ra")
+    port     = resolve_callhome_port(cls)
 
     if ca_ra is not None and protocol == "tls":
         profile = ca_ra_profiles[ca_ra["profile"]]
-        subs = build_subopts_ca_ra(family, profile, ca_ra, ctrl, protocol)
+        subs = build_subopts_ca_ra(family, profile, ca_ra, ctrl, protocol, port)
     else:
-        subs = build_subopts_simple(family, ctrl, protocol)
+        subs = build_subopts_simple(family, ctrl, protocol, port)
 
     # Cross-check against the ISC byte builders (single source of truth guard)
     subopt_enc = _v4_subopt if family == "ipv4" else _v6_subopt
@@ -882,6 +982,30 @@ def _kea_class_lifetimes(cls, lease_profiles, family):
     return out
 
 
+def _kea_v4_t1_t2_option_data(cls, lease_profiles):
+    """T1/T2 option-data entries for a Kea DHCPv4 client class.
+
+    Kea has no per-client-class renew-timer/rebind-timer -- those exist only
+    at subnet and global scope -- so T1 and T2 travel the same way they do in
+    the ISC output, as DHCPv4 options 58 and 59 inside the class.  Without
+    this a class on a short bring-up lease_profile got its lifetimes from Kea
+    but no T1/T2, so ISC and Kea disagreed on renewal timing for exactly the
+    classes doing TLS enrolment.
+
+    DHCPv6 has no equivalent: T1/T2 are fields of the IA_NA, not options, and
+    Kea sets them per subnet.  The v6 class carries lifetimes only.
+    """
+    lp = resolve_lease_params(cls, lease_profiles, "ipv4")
+    if not lp:
+        return []
+    out = []
+    if "renewal_time" in lp:
+        out.append({"name": "dhcp-renewal-time", "data": str(lp["renewal_time"])})
+    if "rebinding_time" in lp:
+        out.append({"name": "dhcp-rebinding-time", "data": str(lp["rebinding_time"])})
+    return out
+
+
 def gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles):
     g       = cfg["global"]
     subnets = cfg["subnets"]["ipv4"]
@@ -914,6 +1038,8 @@ def gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles):
         }
         if mtu:
             entry["option-data"].append({"name": "interface-mtu", "data": str(mtu)})
+        # T1/T2 as options 58/59, mirroring the ISC class block (new in 2.4.0)
+        entry["option-data"].extend(_kea_v4_t1_t2_option_data(cls, lease_profiles))
         # Per-class lifetimes (new in 2.2.0)
         entry.update(_kea_class_lifetimes(cls, lease_profiles, "ipv4"))
         return entry

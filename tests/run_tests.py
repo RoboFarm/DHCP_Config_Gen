@@ -71,8 +71,8 @@ def _hex_to_bytes(chain):
                  .replace(" ", "").strip().strip(";").split(":") if b)
 
 
-def isc_v4_suboption_codes(block):
-    """Decode `option vendor-encapsulated-options <hex>;` into sub-option codes.
+def isc_v4_suboptions(block):
+    """Decode `option vendor-encapsulated-options <hex>;` into (code, value).
 
     DHCPv4 vendor sub-options are 1-byte code, 1-byte length, value.  The chain
     may be split across continuation lines, so it is collected up to the `;`.
@@ -81,17 +81,17 @@ def isc_v4_suboption_codes(block):
     if not m:
         return None
     raw = _hex_to_bytes(m.group(1))
-    codes, i = [], 0
+    subs, i = [], 0
     while i + 1 < len(raw):
         code, length = raw[i], raw[i + 1]
-        codes.append(code)
+        subs.append((code, raw[i + 2:i + 2 + length]))
         i += 2 + length
     assert i == len(raw), "v4 TLV chain is not self-consistent: %r" % (raw,)
-    return codes
+    return subs
 
 
-def isc_v6_suboption_codes(block):
-    """Decode `option dhcp6.vendor-opts <eid> <hex>;` into sub-option codes.
+def isc_v6_suboptions(block):
+    """Decode `option dhcp6.vendor-opts <eid> <hex>;` into (code, value).
 
     DHCPv6 vendor sub-options are 2-byte code, 2-byte length, value.
     """
@@ -99,14 +99,55 @@ def isc_v6_suboption_codes(block):
     if not m:
         return None
     raw = _hex_to_bytes(m.group(1))
-    codes, i = [], 0
+    subs, i = [], 0
     while i + 3 < len(raw):
         code = (raw[i] << 8) | raw[i + 1]
         length = (raw[i + 2] << 8) | raw[i + 3]
-        codes.append(code)
+        subs.append((code, raw[i + 4:i + 4 + length]))
         i += 4 + length
     assert i == len(raw), "v6 TLV chain is not self-consistent: %r" % (raw,)
-    return codes
+    return subs
+
+
+def isc_v4_suboption_codes(block):
+    subs = isc_v4_suboptions(block)
+    return None if subs is None else [c for c, _ in subs]
+
+
+def isc_v6_suboption_codes(block):
+    subs = isc_v6_suboptions(block)
+    return None if subs is None else [c for c, _ in subs]
+
+
+def kea_vendor_data_by_class(kea_cfg, root_key):
+    """{class name: {sub-option code: data string}} from Kea option-data."""
+    cfg = kea_cfg[root_key]
+    name_to_code = {d["name"]: d["code"] for d in cfg.get("option-def", [])}
+    vendor_spaces = {d["space"] for d in cfg.get("option-def", [])}
+    out = {}
+    for cl in cfg.get("client-classes", []):
+        entry = {}
+        for od in cl.get("option-data", []):
+            if od.get("space") not in vendor_spaces:
+                continue
+            code = od.get("code", name_to_code.get(od.get("name")))
+            if code is not None:
+                entry[code] = od.get("data")
+        out[cl["name"]] = entry
+    return out
+
+
+def kea_plain_option_data(kea_cfg, root_key, class_name):
+    """{option name: data} for the non-vendor option-data of one class."""
+    cfg = kea_cfg[root_key]
+    vendor_spaces = {d["space"] for d in cfg.get("option-def", [])}
+    for cl in cfg.get("client-classes", []):
+        if cl["name"] != class_name:
+            continue
+        return {od["name"]: od.get("data")
+                for od in cl.get("option-data", [])
+                if od.get("space") not in vendor_spaces}
+    return {}
 
 
 def kea_vendor_codes_by_class(kea_cfg, root_key):
@@ -283,6 +324,254 @@ def test_isc_v4_controller_ip_is_top_level_suboption_129():
                 "%s class %r: no top-level sub-option 0x81 (controller IP) in %s"
                 % (name, cls, codes))
         assert seen, "%s: no class emitted an option-43 chain at all" % name
+
+
+# ---------------------------------------------------------------------------
+# Call-home over TLS: sub-option 0x87 and the T1/T2 parity it travels with
+# ---------------------------------------------------------------------------
+
+CALLHOME_PORT_CODE = 0x87
+
+
+def _u16(b):
+    return (b[0] << 8) | b[1]
+
+
+def test_callhome_port_agrees_between_isc_and_kea():
+    """0x87 must carry the same port in both backends, for every class.
+
+    Telling an O-RU `protocol: tls` (0x86 = 01) without telling it a port
+    leaves it on its firmware default -- 4334, the SSH call-home port on the
+    Fujitsu units -- so the TLS listener never sees the connection.  The two
+    backends disagreeing on the port is the same failure with extra steps.
+    """
+    for name in INPUTS:
+        g = os.path.join(GOLDEN_DIR, name)
+        for isc_file, kea_file, root, decode in (
+            ("dhcpd.conf", "kea-dhcp4.conf", "Dhcp4", isc_v4_suboptions),
+            ("dhcpd6.conf", "kea-dhcp6.conf", "Dhcp6", isc_v6_suboptions),
+        ):
+            isc_blocks = isc_class_blocks(open(os.path.join(g, isc_file)).read())
+            kea_data = kea_vendor_data_by_class(
+                json.load(open(os.path.join(g, kea_file))), root)
+            for cls in sorted(set(isc_blocks) & set(kea_data)):
+                subs = decode(isc_blocks[cls])
+                if subs is None:
+                    continue
+                isc_port = dict(subs).get(CALLHOME_PORT_CODE)
+                kea_port = kea_data[cls].get(CALLHOME_PORT_CODE)
+                if isc_port is None and kea_port is None:
+                    continue
+                assert isc_port is not None and kea_port is not None, (
+                    "%s class %r: sub-option 0x87 present in only one backend "
+                    "(%s=%r, %s=%r)" % (name, cls, isc_file, isc_port,
+                                        kea_file, kea_port))
+                assert _u16(isc_port) == int(kea_port), (
+                    "%s class %r: call-home port is %d in %s but %s in %s"
+                    % (name, cls, _u16(isc_port), isc_file, kea_port, kea_file))
+
+
+def test_tls_classes_carry_the_tls_callhome_port():
+    """A TLS class that sets a call-home port must say 4335, never 4334.
+
+    0x86 = 01 selects TLS; 0x87 must then select the TLS port.  Emitting
+    0x86 = 01 alongside port 4334 points the O-RU's TLS client at the SSH
+    listener, which is the exact misconfiguration this sub-option exists to
+    prevent.
+    """
+    g = os.path.join(GOLDEN_DIR, "example")
+    blocks = isc_class_blocks(open(os.path.join(g, "dhcpd6.conf")).read())
+    checked = 0
+    for cls, block in blocks.items():
+        subs = isc_v6_suboptions(block)
+        if subs is None:
+            continue
+        by_code = dict(subs)
+        mode = by_code.get(0x86)
+        port = by_code.get(CALLHOME_PORT_CODE)
+        if port is None:
+            continue
+        checked += 1
+        if mode == b"\x01":                       # TLS
+            assert _u16(port) == 4335, (
+                "class %r is TLS (0x86=01) but call-home port is %d -- "
+                "an O-RU told TLS will connect to the SSH listener"
+                % (cls, _u16(port)))
+        else:                                     # SSH: 0x86 absent or 0x00
+            assert _u16(port) == 4334, (
+                "class %r is SSH (0x86=%r) but call-home port is %d"
+                % (cls, mode, _u16(port)))
+    assert checked, "no class in the example golden emits 0x87"
+
+
+def test_callhome_port_is_opt_in():
+    """A model that does not set callhome_port emits no 0x87 at all.
+
+    The lab4 reference sets no callhome_port anywhere, so its wire bytes must
+    be exactly what they were before the sub-option existed -- upgrading the
+    generator must not change what a deployed lab sends.
+    """
+    g = os.path.join(GOLDEN_DIR, "lab4")
+    for isc_file, decode in (("dhcpd.conf", isc_v4_suboptions),
+                             ("dhcpd6.conf", isc_v6_suboptions)):
+        blocks = isc_class_blocks(open(os.path.join(g, isc_file)).read())
+        for cls, block in blocks.items():
+            subs = decode(block)
+            if subs is None:
+                continue
+            assert CALLHOME_PORT_CODE not in dict(subs), (
+                "lab4 sets no callhome_port, but %s class %r emits 0x87"
+                % (isc_file, cls))
+    for kea_file, root in (("kea-dhcp4.conf", "Dhcp4"), ("kea-dhcp6.conf", "Dhcp6")):
+        cfg = json.load(open(os.path.join(g, kea_file)))[root]
+        codes = [d["code"] for d in cfg.get("option-def", [])]
+        assert CALLHOME_PORT_CODE not in codes, (
+            "lab4 sets no callhome_port, but %s defines option code 135" % kea_file)
+
+
+# --- Inline models: properties neither reference input covers ---------------
+
+_TLS_MODEL = """
+global:
+  default_lease_time: 43200
+  max_lease_time: 86400
+  oran_enterprise_id: 53148
+controllers:
+  - name: ctrl
+    ipv4: "192.168.36.220"
+    ipv6: "fd00:8b36:f2a9::24:dc"
+lease_profiles:
+  bringup:
+    default_lease_time: 140
+    max_lease_time: 150
+    preferred_lifetime: 140
+    renewal_time: 60
+    rebinding_time: 120
+oru_classes:
+  - name: Tls4
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    controller: ctrl
+    protocol: tls
+    callhome_port: auto
+    lease_profile: bringup
+    ipv4_range: "192.168.36.160-169"
+    ipv6_range: "fd00:8b36:f2a9::160-169"
+  - name: Unmatched
+    match_prefix: ""
+    controller: ctrl
+    protocol: ssh
+    ipv4_range: "192.168.36.180-189"
+    ipv6_range: "fd00:8b36:f2a9::180-189"
+subnets:
+  ipv4:
+    - subnet: "192.168.36.0/24"
+      gateway: "192.168.36.1"
+      interface: "eth0"
+  ipv6:
+    - subnet: "fd00:8b36:f2a9::/64"
+      interface: "eth0"
+"""
+
+
+def _generate_model(text):
+    """Generate from an inline YAML model.
+
+    Returns (tmpdir, {filename: contents}); the caller removes tmpdir.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-model-")
+    path = os.path.join(tmp, "model.yaml")
+    open(path, "w").write(text)
+    out = os.path.join(tmp, "out")
+    os.makedirs(out)
+    generate_ok(path, out, "--no-timestamp")
+    return tmp, load_generated(out)
+
+
+def test_kea_v4_carries_t1_t2_like_isc_does():
+    """T1/T2 from a lease_profile must reach both backends.
+
+    Kea has no per-client-class renew-timer/rebind-timer, so these have to go
+    out as DHCPv4 options 58/59 the way the ISC class block does.  Handing Kea
+    the short bring-up lifetimes without their T1/T2 left the two backends
+    renewing on different schedules for exactly the classes doing TLS
+    enrolment.  Neither reference input has a v4 class on a lease profile, so
+    this model supplies one.
+    """
+    tmp, files = _generate_model(_TLS_MODEL)
+    try:
+        isc = isc_class_blocks(files["dhcpd.conf"])["Tls4"]
+        assert "option dhcp-renewal-time 60;" in isc
+        assert "option dhcp-rebinding-time 120;" in isc
+
+        kea = kea_plain_option_data(json.loads(files["kea-dhcp4.conf"]),
+                                    "Dhcp4", "Tls4")
+        assert kea.get("dhcp-renewal-time") == "60", (
+            "ISC emits T1=60 for class Tls4 but Kea DHCPv4 emits %r"
+            % kea.get("dhcp-renewal-time"))
+        assert kea.get("dhcp-rebinding-time") == "120", (
+            "ISC emits T2=120 for class Tls4 but Kea DHCPv4 emits %r"
+            % kea.get("dhcp-rebinding-time"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_callhome_port_auto_resolves_per_protocol():
+    """`auto` means 4335 on a TLS class and 4334 on an SSH one."""
+    model = _TLS_MODEL.replace(
+        "    protocol: ssh\n    ipv4_range",
+        "    protocol: ssh\n    callhome_port: auto\n    ipv4_range")
+    tmp, files = _generate_model(model)
+    try:
+        blocks = isc_class_blocks(files["dhcpd.conf"])
+        ports = {cls: _u16(dict(isc_v4_suboptions(blocks[cls]))[CALLHOME_PORT_CODE])
+                 for cls in ("Tls4", "Unmatched")}
+        assert ports == {"Tls4": 4335, "Unmatched": 4334}, \
+            "callhome_port: auto resolved to %r" % (ports,)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_tls_ca_controller_key_is_rejected():
+    """The phantom `tls_ca:` schema must fail loudly, not be ignored.
+
+    A commented-out tls_ca block shipped in the Lab4 reference YAML, so
+    uncommenting it looked like the way to turn on TLS bootstrap.  The
+    generator had no such field: it emitted a payload with no CA/RA
+    sub-options and said nothing.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-tlsca-")
+    try:
+        bad = _write_yaml(tmp, _TLS_MODEL.replace(
+            '    ipv6: "fd00:8b36:f2a9::24:dc"',
+            '    ipv6: "fd00:8b36:f2a9::24:dc"\n'
+            '    tls_ca:\n'
+            '      ipv6: "fd00:8b36:f2a9::95:240"\n'
+            '      port: 8091'))
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(bad, out, "--no-timestamp")
+        assert proc.returncode != 0, "a tls_ca block must not be silently ignored"
+        assert b"ca_ra_profiles" in proc.stdout, (
+            "the tls_ca error should point at the real schema:\n%s"
+            % proc.stdout.decode())
+        assert not os.listdir(out), "must not leave partial output"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bad_callhome_port_is_rejected():
+    for value in ("70000", "0", "'ssh'"):
+        tmp = tempfile.mkdtemp(prefix="oran-gen-port-")
+        try:
+            bad = _write_yaml(tmp, _TLS_MODEL.replace(
+                "    callhome_port: auto", "    callhome_port: %s" % value))
+            proc = generate(bad, tmp, "--no-timestamp")
+            assert proc.returncode != 0, \
+                "callhome_port: %s should be rejected" % value
+            assert b"Traceback" not in proc.stdout, \
+                "callhome_port: %s produced a traceback" % value
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

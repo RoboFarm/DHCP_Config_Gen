@@ -1,3 +1,40 @@
+oran-dhcp-gen (2.4.0) stable; urgency=medium
+
+  * NEW callhome_port on an oru_class emits O-RAN sub-option 0x87, the NETCONF
+    call-home port. Takes an integer or 'auto', which resolves to the RFC 8071
+    port for the class protocol -- SSH 4334, TLS 4335. Until now a class could
+    say "use TLS" (sub-option 0x86 = 0x01) but had no way to say which port, so
+    the O-RU fell back to its firmware default. On the Fujitsu units in the lab
+    that default is 4334, the SSH call-home port: the O-RU opened a TLS
+    connection to the SSH listener and call-home never completed. The
+    hand-written Lab03 ISC configs carried 0x87 (87:02:10:ee) in their
+    alternate option chains; the generator could not express it in either
+    backend.
+    The field is opt-in. A model that does not set it emits no 0x87 and its
+    wire bytes are byte-identical to 2.3.0 -- upgrading does not change what a
+    deployed lab sends.
+  * FIX Kea DHCPv4 dropped T1/T2. A class on a lease_profile with renewal_time
+    and rebinding_time got those as options 58/59 in the ISC class block, but
+    the Kea config carried only the lifetimes, so the two backends renewed on
+    different schedules -- for exactly the short bring-up profiles the TLS
+    enrolment classes use. Kea has no per-client-class renew-timer/rebind-timer,
+    so they are now emitted as class option-data the way ISC emits them.
+    DHCPv6 is unaffected: T1/T2 are IA_NA fields there, not options.
+  * FIX 'tls_ca:' under a controller is now a hard error naming ca_ra_profiles.
+    It was never an implemented field, but a commented-out tls_ca block shipped
+    in the Lab4 reference YAML, so uncommenting it read as the way to turn on
+    TLS bootstrap. The generator ignored it and emitted a payload with no CA/RA
+    sub-options, silently. Unknown fields on a controller, a class or a ca_ra
+    block are now reported as warnings for the same reason.
+  * The Lab4 reference YAML documents the three edits that turn a class from
+    SSH to TLS call-home, in place of the tls_ca sketch it used to carry.
+  * Tests: 0x87 must agree between the two backends and match the protocol
+    (a TLS class emitting port 4334 fails), lab4 must stay free of 0x87 so the
+    opt-in claim is checked, Kea and ISC must agree on T1/T2, and both tls_ca
+    and an out-of-range callhome_port must be rejected without a traceback.
+
+ -- labuser <labuser@dhcp-server>  Mon, 24 Aug 2026 22:40:00 +0000
+
 oran-dhcp-gen (2.3.0) stable; urgency=medium
 
   * NEW --no-timestamp: omit the generation time from config headers so that

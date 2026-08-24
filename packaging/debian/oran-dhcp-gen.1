@@ -29,7 +29,7 @@ Restart DHCP services after successful deploy. Requires --deploy.
 .TP
 .B \-\-version
 Show version and exit.
-.SH "YAML SCHEMA (v2.2.0)"
+.SH "YAML SCHEMA"
 The YAML model has four top-level sections plus oru_classes:
 .TP
 .B global
@@ -52,6 +52,13 @@ via \fIca_ra: { profile: <name>, port: N, ... }\fR.
 List of O-RU classes. \fIipv4_range\fR and \fIipv6_range\fR are now
 both optional (NEW in 2.2.0); omit to disable that family for the class.
 At least one must be present.
+.IP
+\fIcallhome_port\fR (NEW in 2.4.0) emits sub-option 0x87, the NETCONF
+call-home port: an integer, or \fIauto\fR for the RFC 8071 port matching
+the class protocol (SSH 4334, TLS 4335). Omit it and no 0x87 is sent, which
+leaves the O-RU on its firmware default. A \fIprotocol: tls\fR class whose
+firmware defaults to 4334 opens a TLS connection to the SSH listener and
+never calls home, so set this whenever a class is switched to TLS.
 .SH DEPLOY PATHS
 .TP
 dhcpd.conf \-> /etc/dhcp/dhcpd.conf
