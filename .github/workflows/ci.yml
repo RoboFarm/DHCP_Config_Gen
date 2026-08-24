@@ -4,6 +4,11 @@ on:
   push:
     branches: [ master, main ]
   pull_request:
+  # Lets the workflow be started by hand from the Actions tab. Useful when a
+  # workflow has never run -- enabling Actions on a repo does not retroactively
+  # trigger anything, so without this the only way to see a first result is to
+  # push another commit.
+  workflow_dispatch:
 
 jobs:
   test:
