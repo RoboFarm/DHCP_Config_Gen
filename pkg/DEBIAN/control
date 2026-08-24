@@ -1,0 +1,21 @@
+Package: oran-dhcp-gen
+Version: 2.2.3
+Section: net
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.6), python3-yaml
+Maintainer: labuser
+Description: O-RAN DHCP Configuration Generator
+ Generates ISC DHCP and Kea DHCP configuration files from a YAML data model.
+ .
+ ISC target: dhcpd.conf, dhcpd6.conf, isc-dhcp-server
+ Kea target: kea-dhcp4.conf, kea-dhcp6.conf
+ .
+ Features:
+  - Single YAML source of truth for all O-RU DHCP settings
+  - Reusable lease_profiles and ca_ra_profiles for DRY config
+  - Per-class IPv4/IPv6 family enable/disable
+  - Pool-scoped lease times that actually take effect in ISC DHCP
+  - Spec-compliant O-RAN sub-option 0x86 byte (auto from class.protocol)
+  - Multi-line ISC TLV emission for readability of long bootstrap chains
+  - --deploy / --restart for safe in-place rollout

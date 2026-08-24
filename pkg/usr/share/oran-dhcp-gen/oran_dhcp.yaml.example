@@ -1,0 +1,201 @@
+# oran_dhcp.yaml
+# Single source of truth for ISC DHCP / Kea DHCP O-RAN deployment.
+# Generate with:
+#   oran-dhcp-gen oran_dhcp.yaml --target isc          (preview to current dir)
+#   oran-dhcp-gen oran_dhcp.yaml --target isc --deploy --restart   (production)
+#
+# This file was hand-translated from the labpc dhcp-isc-csr2 dhcpd.conf and
+# dhcpd6.conf on 2026-05-04. Designed for oran-dhcp-gen v2.2.0 schema.
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  default_lease_time: 43200      # 12 h — applies to classes WITHOUT lease_profile
+  max_lease_time:     86400      # 24 h
+  oran_enterprise_id: 53148      # O-RAN Alliance IANA — do not change
+
+# ---------------------------------------------------------------------------
+# Controllers — referenced by oru_classes[].controller
+# ---------------------------------------------------------------------------
+controllers:
+  - name: att
+    description: "Unified controller (formerly main + ATT). Both v4 and v6 reach the same controller node."
+    ipv4: "192.168.36.220"
+    ipv6: "fd00:8b36:f2a9::24:dc"
+
+# ---------------------------------------------------------------------------
+# Lease profiles — referenced by oru_classes[].lease_profile (NEW in 2.2.0)
+#
+# When a class references a lease_profile, the generator emits these values
+# at the POOL level (where they actually take effect in ISC DHCP) and as
+# per-client-class lifetimes in Kea.
+#
+# T1 (renewal_time) and T2 (rebinding_time) are emitted as DHCP options
+# inside the class block — those work correctly at class scope.
+# ---------------------------------------------------------------------------
+lease_profiles:
+  bringup:
+    description: "Short lease for ATT classes during bring-up — fast reclaim of stale state."
+    default_lease_time:  140
+    max_lease_time:      150
+    preferred_lifetime:  140    # IPv6 only
+    renewal_time:         60    # T1 — option dhcp-renewal-time
+    rebinding_time:      120    # T2 — option dhcp-rebinding-time
+
+# ---------------------------------------------------------------------------
+# CA/RA profiles — referenced by oru_classes[].ca_ra.profile (NEW in 2.2.0)
+#
+# Captures the parts of a TLS CA/RA bootstrap payload that are identical
+# across multiple classes. Per-class fields (port, mplane_fqdn,
+# include_controller_ip) live on the class itself.
+# ---------------------------------------------------------------------------
+ca_ra_profiles:
+  att_common:
+    description: "ATT/1Finity SPM CA — shared across all ATT TLS classes"
+    ca_server_ipv4:    "192.168.36.240"             # IPv4 sub-opt 0x01
+    ca_server_ipv6:    "fd00:8b36:f2a9::95:240"     # IPv6 sub-opt 0x0001
+    uri_path:          "/pkix/"                      # sub-opt 0x04 / 0x0004
+    subject_dn:        "/OU=SPM/O=1Finity/C=US/CN=ATT-SSL/L=WV/ST=Texas"
+    app_protocol:      "http"
+
+# ---------------------------------------------------------------------------
+# O-RU classes
+#
+# match_prefix    : exact substring of vendor-class-identifier (DHCPv4 opt 60)
+#                   or DHCPv6 vendor-class option 16, after the 6-byte EID
+# controller      : reference to controllers[].name
+# protocol        : ssh | tls
+# lease_profile   : optional reference to lease_profiles
+# ipv4_range      : OPTIONAL — omit to disable IPv4 family for this class
+# ipv6_range      : OPTIONAL — omit to disable IPv6 family for this class
+#                   (at least one must be present)
+# ca_ra:          : OPTIONAL block, only meaningful when protocol is tls
+#   profile               : reference to ca_ra_profiles
+#   port                  : per-class CA port (sub-opt 0x03 / 0x0003)
+#   mplane_fqdn           : optional sub-opt 0x82 / 0x0082 string
+#   include_controller_ip : optional bool, default true (sub-opt 0x81 / 0x0081)
+# ---------------------------------------------------------------------------
+oru_classes:
+
+  - name: Gen1DB
+    description: "Generation 1 Dual Band (Fujitsu N706600R)"
+    match_prefix: "o-ran-ru2/FJ/N706600R"
+    controller: att
+    protocol: ssh
+    ipv4_range: "192.168.36.70-79"
+    ipv6_range: "fd00:8b36:f2a9::70-79"
+
+  - name: Gen1TB
+    description: "Generation 1 Tower Base (Fujitsu N712926R)"
+    match_prefix: "o-ran-ru2/FJ/N712926R"
+    controller: att
+    protocol: ssh
+    ipv4_range: "192.168.36.80-89"
+    ipv6_range: "fd00:8b36:f2a9::80-89"
+    options:
+      interface_mtu: 1440
+
+  - name: Gen2DB
+    description: "Generation 2 Dual Band (Fujitsu N706600S)"
+    match_prefix: "o-ran-ru2/FJ/N706600S"
+    controller: att
+    protocol: ssh
+    ipv4_range: "192.168.36.90-99"
+    ipv6_range: "fd00:8b36:f2a9::90-99"
+
+  - name: Gen2TB
+    description: "Generation 2 Tower Base (Fujitsu N712926S)"
+    match_prefix: "o-ran-ru2/FJ/N712926S"
+    controller: att
+    protocol: ssh
+    ipv4_range: "192.168.36.100-109"
+    ipv6_range: "fd00:8b36:f2a9::100-109"
+
+  - name: TB2
+    description: "Tower Base Gen2 variant (Fujitsu N717066M)"
+    match_prefix: "o-ran-ru2/FJ/N717066M"
+    controller: att
+    protocol: ssh
+    ipv4_range: "192.168.36.110-119"
+    ipv6_range: "fd00:8b36:f2a9::110-119"
+
+  - name: n77
+    description: "n77 band RU (Fujitsu N70660 family — short prefix matches all)"
+    match_prefix: "o-ran-ru2/FJ/N70660"
+    controller: att
+    protocol: ssh
+    ipv4_range: "192.168.36.120-129"
+    ipv6_range: "fd00:8b36:f2a9::120-129"
+
+  - name: ATTn77
+    description: "ATT n77 RU (44R14 series) — TLS bootstrap, IPv6-only"
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    controller: att
+    protocol: tls
+    lease_profile: bringup
+    # ipv4_range intentionally omitted — IPv4 disabled for ATT classes
+    ipv6_range: "fd00:8b36:f2a9::130-149"
+    ca_ra:
+      profile: att_common
+      port: 8093
+      mplane_fqdn: "mplane.local"        # sub-opt 0x0082 — ATTn77 only
+      include_controller_ip: false        # sub-opt 0x0081 NOT included for ATTn77
+
+  - name: ATTn25n66-DC
+    description: "ATT n25/n66 DC variant (44R26 DC)"
+    match_prefix: "o-ran-ru2/FJ/44R26-N25N66-DC/"
+    controller: att
+    protocol: tls
+    lease_profile: bringup
+    ipv6_range: "fd00:8b36:f2a9::150-159"  # SHARED with ATTn25n66-AC
+    ca_ra:
+      profile: att_common
+      port: 8095
+      include_controller_ip: true         # DC includes sub-opt 0x0081
+
+  - name: ATTn25n66-AC
+    description: "ATT n25/n66 AC variant (44R26 AC)"
+    match_prefix: "o-ran-ru2/FJ/44R26-N25N66-AC/"
+    controller: att
+    protocol: tls
+    lease_profile: bringup
+    ipv6_range: "fd00:8b36:f2a9::160-189"  # SHARED with ATTn25n66-DC
+    ca_ra:
+      profile: att_common
+      port: 8097
+      include_controller_ip: true
+
+  - name: DTTB3
+    description: "DT TB3 (Fujitsu N75N3N1-G-RU) — wide bring-up pool"
+    match_prefix: "o-ran-ru2/FJ/N75N3N1-G-RU"
+    controller: att
+    protocol: ssh
+    ipv6_range: "fd00:8b36:f2a9::190-199"
+
+  # Catch-all — keep last
+  - name: Unmatched
+    description: "Fallback for unrecognised vendor-class strings"
+    match_prefix: ""
+    controller: att
+    protocol: ssh
+    ipv4_range: "192.168.36.200-229"
+    ipv6_range: "fd00:8b36:f2a9::200-229"
+    options:
+      interface_mtu: 1440
+
+# ---------------------------------------------------------------------------
+# Subnets
+# ---------------------------------------------------------------------------
+subnets:
+  ipv4:
+    - subnet: "192.168.36.0/24"
+      gateway: "192.168.36.1"
+      interface: "ens20.201"
+      # No DNS option emitted — matches current dhcpd.conf
+
+  ipv6:
+    - subnet: "fd00:8b36:f2a9::/64"
+      dns_servers:
+        - "fd00:8b36:f2a9::24:14"
+      interface: "ens20.201"

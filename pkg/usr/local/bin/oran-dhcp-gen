@@ -1,0 +1,1241 @@
+#!/usr/bin/env python3
+"""
+oran-dhcp-gen - O-RAN DHCP Configuration Generator
+
+Reads oran_dhcp.yaml and generates DHCP server configuration files for
+ISC DHCP and/or Kea DHCP from a single source of truth.
+
+Supported targets:
+  isc  - ISC DHCP: dhcpd.conf, dhcpd6.conf, isc-dhcp-server defaults
+  kea  - Kea DHCP: kea-dhcp4.conf, kea-dhcp6.conf
+  all  - All of the above
+
+Version: 2.2.2
+Changelog:
+  1.0.0 - Initial release: ISC DHCP IPv4 + IPv6 output targets
+  1.1.0 - Added isc-dhcp-server defaults file generation
+  2.0.0 - Added Kea DHCP IPv4 + IPv6 output targets
+  2.1.0 - Added --deploy and --restart flags
+  2.1.1 - Fixed Kea-2.4 schema bugs
+  2.2.0 - lease_profiles, ca_ra_profiles, optional ipv4_range/ipv6_range,
+          shared pool emission, lease params at pool scope
+  2.2.1 - Spec-compliant sub-option 0x86 byte (auto from class.protocol)
+  2.2.3 - FIX Kea backend: vendor payload was emitted as a binary blob
+          nested under sub-option code 1, which Kea wraps in its own TLV
+          (wire: 01 LL <payload> instead of bare 81 04 ...). O-RUs skip
+          unknown sub-option 0x01 and never learn the controller IP.
+          Kea backend now emits typed option-defs per O-RAN sub-option
+          (0x01/0x03/0x04/0x05/0x06/0x81/0x82/0x86) and per-class typed
+          option-data; Kea builds the TLVs, matching ISC wire bytes.
+          Added generation-time cross-check: structured sub-options are
+          re-encoded to bytes and asserted equal to the ISC chunk
+          builders' output. ISC output unchanged.
+  2.2.2 - Multi-line ISC TLV emission for readability. Vendor option
+          chains with 3+ sub-options now render with each sub-option
+          on its own continuation line (preserving the visual structure
+          of hand-edited dhcpd.conf / dhcpd6.conf files). Single-line
+          for 1-2 sub-options. Wire bytes unchanged.
+"""
+
+import sys
+import re
+import json
+import ipaddress
+import argparse
+from pathlib import Path
+from datetime import datetime
+
+try:
+    import yaml
+except ImportError:
+    print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
+    sys.exit(1)
+
+__version__ = "2.2.3"
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+REQUIRED_GLOBAL = ["default_lease_time", "max_lease_time", "oran_enterprise_id"]
+REQUIRED_CTRL   = ["name", "ipv4", "ipv6"]
+REQUIRED_CLASS  = ["name", "match_prefix", "controller", "protocol"]
+VALID_PROTOCOLS = ["ssh", "tls"]
+
+
+def die(msg):
+    print(f"[ERROR] {msg}")
+    sys.exit(1)
+
+
+def warn(msg):
+    print(f"[WARN] {msg}")
+
+
+def validate(cfg):
+    """
+    Validate the YAML model and return a tuple of lookup dicts:
+      (controllers, lease_profiles, ca_ra_profiles)
+    Each is keyed by name.
+    """
+    for f in REQUIRED_GLOBAL:
+        if f not in cfg.get("global", {}):
+            die(f"global.{f} is required")
+
+    # --- controllers ---
+    controllers = {}
+    for c in cfg.get("controllers", []):
+        for f in REQUIRED_CTRL:
+            if f not in c:
+                die(f"Controller missing required field: '{f}'")
+        controllers[c["name"]] = c
+    if not controllers:
+        die("At least one controller must be defined")
+
+    # --- lease_profiles (optional, new in 2.2.0) ---
+    lease_profiles = {}
+    for name, prof in (cfg.get("lease_profiles") or {}).items():
+        # All fields optional; defaults applied at emission time
+        lease_profiles[name] = prof or {}
+
+    # --- ca_ra_profiles (optional, new in 2.2.0) ---
+    ca_ra_profiles = {}
+    for name, prof in (cfg.get("ca_ra_profiles") or {}).items():
+        if not prof:
+            die(f"ca_ra_profile '{name}' is empty")
+        # Required for either family that's used:
+        # ca_server_ipv4 OR ca_server_ipv6 must be present
+        if "ca_server_ipv4" not in prof and "ca_server_ipv6" not in prof:
+            die(f"ca_ra_profile '{name}' must define at least one of "
+                f"ca_server_ipv4 or ca_server_ipv6")
+        for f in ("uri_path", "subject_dn", "app_protocol"):
+            if f not in prof:
+                die(f"ca_ra_profile '{name}' missing required field: '{f}'")
+        # netconf_mode_byte: deprecated as of 2.2.1 — auto-derived from
+        # class.protocol per O-RAN WG4 §6.2.5. If present, warn and keep
+        # the override (escape hatch for unusual firmware), but recommend
+        # removal.
+        if "netconf_mode_byte" in prof:
+            warn(f"ca_ra_profile '{name}' sets 'netconf_mode_byte' explicitly; "
+                 f"this field is deprecated in 2.2.1 (auto-derived from "
+                 f"class.protocol per O-RAN WG4 spec). Remove it to use the "
+                 f"spec-compliant default. Override accepted for now.")
+        ca_ra_profiles[name] = prof
+
+    # --- subnets ---
+    if "subnets" not in cfg:
+        die("subnets section is required")
+    if not cfg["subnets"].get("ipv4"):
+        die("subnets.ipv4 is required")
+    if not cfg["subnets"].get("ipv6"):
+        die("subnets.ipv6 is required")
+
+    # --- oru_classes ---
+    classes = cfg.get("oru_classes", [])
+    if not classes:
+        die("At least one oru_class must be defined")
+
+    names_seen = set()
+    for cls in classes:
+        for f in REQUIRED_CLASS:
+            if f not in cls:
+                die(f"oru_class '{cls.get('name','?')}' missing required field: '{f}'")
+        name = cls["name"]
+        if name in names_seen:
+            die(f"Duplicate oru_class name: '{name}'")
+        names_seen.add(name)
+        if cls["controller"] not in controllers:
+            die(f"oru_class '{name}' references unknown controller: '{cls['controller']}'")
+        if cls["protocol"] not in VALID_PROTOCOLS:
+            die(f"oru_class '{name}' protocol must be 'ssh' or 'tls', got: '{cls['protocol']}'")
+
+        # New: ranges are now optional (presence enables that family)
+        if "ipv4_range" not in cls and "ipv6_range" not in cls:
+            die(f"oru_class '{name}' must have at least one of ipv4_range or ipv6_range")
+        if "ipv4_range" in cls:
+            parse_ipv4_range(cls["ipv4_range"], name)
+        if "ipv6_range" in cls:
+            parse_ipv6_range(cls["ipv6_range"], name)
+
+        # New: lease_profile reference
+        lp = cls.get("lease_profile")
+        if lp is not None and lp not in lease_profiles:
+            die(f"oru_class '{name}' references undefined lease_profile: '{lp}'")
+
+        # New: ca_ra block validation
+        ca_ra = cls.get("ca_ra")
+        if ca_ra is not None:
+            if cls["protocol"] != "tls":
+                warn(f"oru_class '{name}' has ca_ra block but protocol is '{cls['protocol']}'"
+                     f" — ca_ra will be ignored. Set protocol: tls to use it.")
+            if "profile" not in ca_ra:
+                die(f"oru_class '{name}' ca_ra block missing required field: 'profile'")
+            if ca_ra["profile"] not in ca_ra_profiles:
+                die(f"oru_class '{name}' ca_ra references undefined profile: '{ca_ra['profile']}'")
+            if "port" not in ca_ra:
+                die(f"oru_class '{name}' ca_ra block missing required field: 'port'")
+
+    print(f"[OK] Validation passed — {len(classes)} O-RU classes, "
+          f"{len(controllers)} controllers, "
+          f"{len(lease_profiles)} lease profiles, "
+          f"{len(ca_ra_profiles)} ca_ra profiles")
+    return controllers, lease_profiles, ca_ra_profiles
+
+
+# ---------------------------------------------------------------------------
+# Range parsing
+# ---------------------------------------------------------------------------
+
+def parse_ipv4_range(range_str, class_name="?"):
+    m = re.match(r'^(\d+\.\d+\.\d+\.)(\d+)-(\d+)$', range_str)
+    if not m:
+        die(f"oru_class '{class_name}': invalid ipv4_range format: '{range_str}'\n"
+            f"  Expected: '192.168.36.100-109'")
+    prefix, start, end = m.group(1), int(m.group(2)), int(m.group(3))
+    if start > end:
+        die(f"oru_class '{class_name}': ipv4_range start > end in '{range_str}'")
+    return f"{prefix}{start}", f"{prefix}{end}"
+
+
+def parse_ipv6_range(range_str, class_name="?"):
+    m = re.match(r'^(.+::)([0-9a-fA-F]+)-([0-9a-fA-F]+)$', range_str)
+    if not m:
+        die(f"oru_class '{class_name}': invalid ipv6_range format: '{range_str}'\n"
+            f"  Expected: 'fd00:8b36:f2a9::100-109'")
+    prefix, start, end = m.group(1), m.group(2), m.group(3)
+    try:
+        ipaddress.IPv6Address(f"{prefix}{start}")
+        ipaddress.IPv6Address(f"{prefix}{end}")
+    except ValueError as e:
+        die(f"oru_class '{class_name}': invalid IPv6 address in range '{range_str}': {e}")
+    return f"{prefix}{start}", f"{prefix}{end}"
+
+
+# ---------------------------------------------------------------------------
+# Pool grouping (new in 2.2.0)
+# ---------------------------------------------------------------------------
+
+def group_classes_by_range(classes, family):
+    """
+    Group classes that share the same IP range so we emit one pool block
+    with multiple `allow members of` statements.
+
+    Returns a list of (range_str, [class_dict, ...]) tuples, in the order
+    each range first appears in the YAML.
+    """
+    range_key = "ipv4_range" if family == "ipv4" else "ipv6_range"
+    groups = []
+    seen = {}  # range_str -> index into groups
+    for cls in classes:
+        rng = cls.get(range_key)
+        if rng is None:
+            continue
+        if rng in seen:
+            groups[seen[rng]][1].append(cls)
+        else:
+            seen[rng] = len(groups)
+            groups.append((rng, [cls]))
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# TLV builders — simple (legacy v2.1) form
+#
+# Each builder returns a list of sub-option byte chunks (one bytes object
+# per sub-option). Callers can flatten with b"".join(chunks) for Kea, or
+# format multi-line for ISC.
+# ---------------------------------------------------------------------------
+
+def build_option43_chunks_simple(ctrl_ipv4, protocol):
+    """DHCPv4 simple form — chunks per sub-option."""
+    chunks = [bytes([0x81, 0x04]) + ipaddress.IPv4Address(ctrl_ipv4).packed]
+    if protocol == "tls":
+        chunks.append(bytes([0x86, 0x01, 0x01]))
+    return chunks
+
+
+def build_option17_chunks_simple(ctrl_ipv6, protocol):
+    """DHCPv6 simple form — chunks per sub-option."""
+    chunks = [bytes([0x00, 0x81, 0x00, 0x10]) + ipaddress.IPv6Address(ctrl_ipv6).packed]
+    if protocol == "tls":
+        chunks.append(bytes([0x00, 0x86, 0x00, 0x01, 0x01]))
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# TLV builders — full ATT-style CA/RA form (new in 2.2.0)
+# ---------------------------------------------------------------------------
+#
+# Sub-option codes (same numeric codes for IPv4 and IPv6, but the IPv4 vendor
+# sub-option header is 1-byte tag + 1-byte length, while IPv6 vendor sub-option
+# header is 2-byte tag + 2-byte length per RFC 3315 / 8415).
+#
+# Code  IPv4 hdr   IPv6 hdr   Field                 Source
+# ----  ---------  ---------  --------------------  -----------------------
+# 0x01  01:LL      00:01:LL   CA server IP          ca_ra_profile
+# 0x03  03:LL      00:03:LL   CA port (uint16 BE)   class.ca_ra.port
+# 0x04  04:LL      00:04:LL   URI path (string)     ca_ra_profile
+# 0x05  05:LL      00:05:LL   Subject DN (string)   ca_ra_profile
+# 0x06  06:LL      00:06:LL   App protocol (str)    ca_ra_profile
+# 0x81  81:LL      00:81:LL   Controller IP         class.controller (opt-in)
+# 0x82  82:LL      00:82:LL   M-plane FQDN (str)    class.ca_ra.mplane_fqdn
+# 0x86  86:LL      00:86:LL   NETCONF mode (uint8)  ca_ra_profile (default 0x00)
+# ---------------------------------------------------------------------------
+
+
+def _v4_subopt(code, value_bytes):
+    """1-byte tag + 1-byte length + value (DHCPv4 vendor sub-option)."""
+    if len(value_bytes) > 0xFF:
+        die(f"DHCPv4 sub-option 0x{code:02x} value too long: {len(value_bytes)} bytes (max 255)")
+    return bytes([code, len(value_bytes)]) + value_bytes
+
+
+def _v6_subopt(code, value_bytes):
+    """2-byte tag + 2-byte length + value (DHCPv6 vendor sub-option)."""
+    return bytes([
+        (code >> 8) & 0xFF, code & 0xFF,
+        (len(value_bytes) >> 8) & 0xFF, len(value_bytes) & 0xFF,
+    ]) + value_bytes
+
+
+def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol):
+    """
+    Build the full ATT-style vendor sub-option chain as a list of
+    per-sub-option byte chunks (one bytes object per sub-option).
+
+      family       : "ipv4" or "ipv6"
+      profile      : ca_ra_profiles entry (dict)
+      ca_ra_class  : class-level ca_ra block (dict; has 'port', optional
+                     'mplane_fqdn', optional 'include_controller_ip')
+      controller   : controllers[name] entry (used if include_controller_ip)
+      protocol     : "ssh" or "tls" — used to derive sub-opt 0x86 byte
+                     per O-RAN WG4 §6.2.5 (0x00=SSH, 0x01=TLS).
+                     Profile-level 'netconf_mode_byte' overrides if set
+                     (deprecated escape hatch).
+    """
+    is_v4 = (family == "ipv4")
+    subopt = _v4_subopt if is_v4 else _v6_subopt
+    chunks = []
+
+    # 0x01: CA server IP (always present)
+    if is_v4:
+        ca_ip = profile.get("ca_server_ipv4")
+        if ca_ip is None:
+            die(f"ca_ra_profile must define ca_server_ipv4 to emit IPv4 sub-options")
+        chunks.append(subopt(0x01, ipaddress.IPv4Address(ca_ip).packed))
+    else:
+        ca_ip = profile.get("ca_server_ipv6")
+        if ca_ip is None:
+            die(f"ca_ra_profile must define ca_server_ipv6 to emit IPv6 sub-options")
+        chunks.append(subopt(0x01, ipaddress.IPv6Address(ca_ip).packed))
+
+    # 0x03: CA port
+    port = int(ca_ra_class["port"])
+    chunks.append(subopt(0x03, bytes([(port >> 8) & 0xFF, port & 0xFF])))
+
+    # 0x04: URI path
+    chunks.append(subopt(0x04, profile["uri_path"].encode("ascii")))
+
+    # 0x05: Subject DN
+    chunks.append(subopt(0x05, profile["subject_dn"].encode("ascii")))
+
+    # 0x06: App protocol
+    chunks.append(subopt(0x06, profile["app_protocol"].encode("ascii")))
+
+    # 0x81: Controller IP (optional, default include)
+    if ca_ra_class.get("include_controller_ip", True):
+        if is_v4:
+            chunks.append(subopt(0x81, ipaddress.IPv4Address(controller["ipv4"]).packed))
+        else:
+            chunks.append(subopt(0x81, ipaddress.IPv6Address(controller["ipv6"]).packed))
+
+    # 0x82: M-plane FQDN (optional)
+    fqdn = ca_ra_class.get("mplane_fqdn")
+    if fqdn:
+        chunks.append(subopt(0x82, fqdn.encode("ascii")))
+
+    # 0x86: Call-home protocol byte (auto-derived from class.protocol per O-RAN
+    # WG4 R004 §6.2.5; profile override accepted but deprecated)
+    if "netconf_mode_byte" in profile:
+        mode_byte = int(profile["netconf_mode_byte"]) & 0xFF
+    else:
+        mode_byte = 0x01 if protocol == "tls" else 0x00
+    chunks.append(subopt(0x86, bytes([mode_byte])))
+
+    return chunks
+
+
+def bytes_to_hex_str(b, sep=":"):
+    return sep.join(f"{x:02x}" for x in b)
+
+
+# ---------------------------------------------------------------------------
+# Per-class TLV resolution
+# ---------------------------------------------------------------------------
+
+def resolve_tlv(family, cls, controllers, ca_ra_profiles):
+    """
+    Return (chunks, hex_str, raw_bytes) for the vendor option payload to send
+    to clients matching this class on this family.
+
+    chunks: list of bytes, one entry per sub-option (for multi-line emission)
+    hex_str: ":"-separated flat hex string (legacy convenience)
+    raw_bytes: flat bytes (used by Kea binary blob path)
+
+    family: "ipv4" or "ipv6"
+    """
+    ctrl     = controllers[cls["controller"]]
+    protocol = cls["protocol"]
+    ca_ra    = cls.get("ca_ra")
+
+    if ca_ra is not None and protocol == "tls":
+        profile = ca_ra_profiles[ca_ra["profile"]]
+        chunks = build_ca_ra_chunks(family, profile, ca_ra, ctrl, protocol)
+    else:
+        # Simple legacy form (v2.1.x compatible)
+        if family == "ipv4":
+            chunks = build_option43_chunks_simple(ctrl["ipv4"], protocol)
+        else:
+            chunks = build_option17_chunks_simple(ctrl["ipv6"], protocol)
+
+    raw = b"".join(chunks)
+    return chunks, bytes_to_hex_str(raw), raw
+
+
+# ---------------------------------------------------------------------------
+# Structured sub-options (Kea typed path, new in 2.2.3)
+#
+# The Kea backend must NOT pre-encode the TLV chain: any option-data placed
+# in a vendor space gets wrapped by Kea in that sub-option's own TLV header.
+# (The 2.2.0-2.2.2 blob-under-code-1 approach produced 01 LL <payload> on the
+# wire instead of bare 81 04 ... — O-RUs skip unknown sub-option 0x01.)
+#
+# Instead we describe each O-RAN sub-option with its real code and a Kea
+# option-def type, and let Kea build the TLVs. Wire bytes then match the
+# ISC output exactly.
+# ---------------------------------------------------------------------------
+
+# code -> (kea option name, {family: kea type})
+KEA_SUBOPT_DEFS = {
+    0x01: ("oran-ca-server-ip",      {"ipv4": "ipv4-address", "ipv6": "ipv6-address"}),
+    0x03: ("oran-ca-port",           {"ipv4": "uint16",       "ipv6": "uint16"}),
+    0x04: ("oran-ca-uri-path",       {"ipv4": "string",       "ipv6": "string"}),
+    0x05: ("oran-ca-subject-dn",     {"ipv4": "string",       "ipv6": "string"}),
+    0x06: ("oran-ca-app-protocol",   {"ipv4": "string",       "ipv6": "string"}),
+    0x81: ("oran-netconf-server-ip", {"ipv4": "ipv4-address", "ipv6": "ipv6-address"}),
+    0x82: ("oran-mplane-fqdn",       {"ipv4": "string",       "ipv6": "string"}),
+    0x86: ("oran-netconf-mode",      {"ipv4": "uint8",        "ipv6": "uint8"}),
+}
+
+
+def _subopt_struct(code, kea_type, kea_data):
+    return {"code": code, "type": kea_type, "data": kea_data}
+
+
+def build_subopts_simple(family, ctrl, protocol):
+    """Structured simple form — mirrors build_option43/17_chunks_simple."""
+    ip_type = "ipv4-address" if family == "ipv4" else "ipv6-address"
+    ip_key  = "ipv4" if family == "ipv4" else "ipv6"
+    subs = [_subopt_struct(0x81, ip_type, ctrl[ip_key])]
+    if protocol == "tls":
+        subs.append(_subopt_struct(0x86, "uint8", "1"))
+    return subs
+
+
+def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol):
+    """Structured full ATT-style CA/RA form — mirrors build_ca_ra_chunks."""
+    is_v4   = (family == "ipv4")
+    ip_type = "ipv4-address" if is_v4 else "ipv6-address"
+    ip_key  = "ipv4" if is_v4 else "ipv6"
+    ca_key  = "ca_server_ipv4" if is_v4 else "ca_server_ipv6"
+
+    ca_ip = profile.get(ca_key)
+    if ca_ip is None:
+        die(f"ca_ra_profile must define {ca_key} to emit {family} sub-options")
+
+    subs = [
+        _subopt_struct(0x01, ip_type, ca_ip),
+        _subopt_struct(0x03, "uint16", str(int(ca_ra_class["port"]))),
+        _subopt_struct(0x04, "string", profile["uri_path"]),
+        _subopt_struct(0x05, "string", profile["subject_dn"]),
+        _subopt_struct(0x06, "string", profile["app_protocol"]),
+    ]
+    if ca_ra_class.get("include_controller_ip", True):
+        subs.append(_subopt_struct(0x81, ip_type, controller[ip_key]))
+    fqdn = ca_ra_class.get("mplane_fqdn")
+    if fqdn:
+        subs.append(_subopt_struct(0x82, "string", fqdn))
+    if "netconf_mode_byte" in profile:
+        mode_byte = int(profile["netconf_mode_byte"]) & 0xFF
+    else:
+        mode_byte = 0x01 if protocol == "tls" else 0x00
+    subs.append(_subopt_struct(0x86, "uint8", str(mode_byte)))
+    return subs
+
+
+def _subopt_value_bytes(s):
+    """Encode a structured sub-option's value to raw bytes (for cross-check)."""
+    t, d = s["type"], s["data"]
+    if t == "ipv4-address":
+        return ipaddress.IPv4Address(d).packed
+    if t == "ipv6-address":
+        return ipaddress.IPv6Address(d).packed
+    if t == "uint8":
+        return bytes([int(d) & 0xFF])
+    if t == "uint16":
+        v = int(d)
+        return bytes([(v >> 8) & 0xFF, v & 0xFF])
+    if t == "string":
+        return d.encode("ascii")
+    die(f"internal: unknown sub-option type '{t}'")
+
+
+def _kea_escape_data(s):
+    """Escape commas for Kea option-data string values (csv separator)."""
+    if s["type"] == "string":
+        return s["data"].replace(",", "\\,")
+    return s["data"]
+
+
+def resolve_suboptions(family, cls, controllers, ca_ra_profiles):
+    """
+    Return the structured sub-option list for this class/family, and verify
+    it re-encodes to exactly the bytes the ISC chunk builders produce.
+    A mismatch means the two representations have drifted — die loudly
+    rather than emit configs that differ between ISC and Kea targets.
+    """
+    ctrl     = controllers[cls["controller"]]
+    protocol = cls["protocol"]
+    ca_ra    = cls.get("ca_ra")
+
+    if ca_ra is not None and protocol == "tls":
+        profile = ca_ra_profiles[ca_ra["profile"]]
+        subs = build_subopts_ca_ra(family, profile, ca_ra, ctrl, protocol)
+    else:
+        subs = build_subopts_simple(family, ctrl, protocol)
+
+    # Cross-check against the ISC byte builders (single source of truth guard)
+    subopt_enc = _v4_subopt if family == "ipv4" else _v6_subopt
+    derived = b"".join(subopt_enc(s["code"], _subopt_value_bytes(s)) for s in subs)
+    chunks, _, raw = resolve_tlv(family, cls, controllers, ca_ra_profiles)
+    if derived != raw:
+        die(f"internal: structured sub-options for class '{cls['name']}' "
+            f"({family}) re-encode to {bytes_to_hex_str(derived)} but ISC "
+            f"builders produce {bytes_to_hex_str(raw)} — generator bug, "
+            f"refusing to emit divergent configs")
+    return subs
+
+
+def kea_option_defs_for(family, space, all_class_subs):
+    """Emit option-def entries for every sub-option code used, sorted."""
+    used = sorted({s["code"] for subs in all_class_subs for s in subs})
+    defs = []
+    for code in used:
+        name, types = KEA_SUBOPT_DEFS[code]
+        defs.append({
+            "name":  name,
+            "code":  code,
+            "space": space,
+            "type":  types[family],
+        })
+    return defs
+
+
+# Threshold: if the TLV has this many or more sub-option chunks, emit
+# the ISC option statement across multiple lines (one chunk per line)
+# for readability. Single-line otherwise. Wire bytes are identical
+# either way — ISC dhcpd accepts hex octet sequences across newlines.
+ISC_MULTILINE_CHUNK_THRESHOLD = 3
+
+
+def format_isc_option_chain(option_keyword, chunks, eid=None,
+                            stmt_indent="    "):
+    """
+    Format an ISC DHCP option statement value as either a single line
+    (for chains with fewer than ISC_MULTILINE_CHUNK_THRESHOLD sub-options)
+    or multiple lines (for ≥ that many). Returns a list of output lines.
+
+    Single-line form:
+        <stmt_indent>option <keyword> [<eid>] hex:hex:...:hex;
+
+    Multi-line form (continuation lines indented to match the parent stmt):
+        <stmt_indent>option <keyword> [<eid>] <chunk1_hex>
+        <stmt_indent>:<chunk2_hex>
+        <stmt_indent>:<chunk3_hex>
+        ...
+        <stmt_indent>:<lastchunk_hex>;
+    """
+    hex_chunks = [bytes_to_hex_str(c) for c in chunks]
+    eid_str = f"{eid} " if eid is not None else ""
+
+    if len(hex_chunks) < ISC_MULTILINE_CHUNK_THRESHOLD:
+        joined = ":".join(hex_chunks)
+        return [f"{stmt_indent}option {option_keyword} {eid_str}{joined};"]
+
+    out = [f"{stmt_indent}option {option_keyword} {eid_str}{hex_chunks[0]}"]
+    for h in hex_chunks[1:-1]:
+        out.append(f"{stmt_indent}:{h}")
+    out.append(f"{stmt_indent}:{hex_chunks[-1]};")
+    return out
+
+
+def resolve_lease_params(cls, lease_profiles, family):
+    """
+    Return a dict of resolved lease parameters for this class on this family,
+    or None if the class doesn't reference a lease profile.
+
+    Keys returned (when present in the profile):
+      default_lease_time, max_lease_time, preferred_lifetime (v6 only),
+      renewal_time, rebinding_time
+    """
+    lp_name = cls.get("lease_profile")
+    if lp_name is None:
+        return None
+    prof = lease_profiles[lp_name]
+    out = {}
+    for k in ("default_lease_time", "max_lease_time", "renewal_time", "rebinding_time"):
+        if k in prof:
+            out[k] = prof[k]
+    if family == "ipv6" and "preferred_lifetime" in prof:
+        out["preferred_lifetime"] = prof["preferred_lifetime"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ISC DHCP generators
+# ---------------------------------------------------------------------------
+
+def gen_isc_v4(cfg, controllers, lease_profiles, ca_ra_profiles):
+    g = cfg["global"]
+    subnets = cfg["subnets"]["ipv4"]
+    classes = cfg["oru_classes"]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        f"# dhcpd.conf",
+        f"# Generated by oran-dhcp-gen v{__version__} on {ts}",
+        f"# Source: oran_dhcp.yaml  |  DO NOT EDIT MANUALLY",
+        f"",
+        f"default-lease-time {g['default_lease_time']};",
+        f"max-lease-time {g['max_lease_time']};",
+        f"",
+        f"option vendor-class-identifier code 60 = string;",
+        f"option interface-mtu code 26 = unsigned integer 16;",
+        f"",
+        f'log(info, concat("Vendor Class String: ", option vendor-class-identifier));',
+        f"",
+    ]
+
+    # --- Class declarations ---
+    # Only emit a class if the class participates in IPv4 (has ipv4_range).
+    v4_classes = [c for c in classes if "ipv4_range" in c]
+
+    for cls in v4_classes:
+        name      = cls["name"]
+        prefix    = cls["match_prefix"]
+        match_len = len(prefix)
+        ctrl      = controllers[cls["controller"]]
+        protocol  = cls["protocol"]
+        chunks, _, _ = resolve_tlv("ipv4", cls, controllers, ca_ra_profiles)
+        mtu       = (cls.get("options") or {}).get("interface_mtu")
+        lease     = resolve_lease_params(cls, lease_profiles, "ipv4")
+
+        lines.append(f'class "{name}" {{')
+        if prefix == "":
+            lines.append(f'    match if substring(option vendor-class-identifier, 0, 0) = "";')
+            lines.append(f'    log (info, "Matched {name} class");')
+            lines.append(f'    log (info, concat("Unmatched Vendor Class String: ",'
+                         f' option vendor-class-identifier));')
+        else:
+            lines.append(f'    match if substring(option vendor-class-identifier,'
+                         f' 0, {match_len}) = "{prefix}";')
+            lines.append(f'    log (info, "Matched {name} class");')
+        lines.append(f'    # Controller: {cls["controller"]} ({ctrl["ipv4"]}) protocol: {protocol}')
+        lines.extend(format_isc_option_chain("vendor-encapsulated-options",
+                                             chunks, eid=None))
+        # T1/T2 are options — they DO take effect inside class blocks
+        if lease and "renewal_time" in lease:
+            lines.append(f'    option dhcp-renewal-time {lease["renewal_time"]};')
+        if lease and "rebinding_time" in lease:
+            lines.append(f'    option dhcp-rebinding-time {lease["rebinding_time"]};')
+        if mtu:
+            lines.append(f'    option interface-mtu {mtu};')
+        lines.append(f'}}')
+        lines.append(f'')
+
+    # --- Subnets ---
+    for subnet in subnets:
+        network = ipaddress.IPv4Network(subnet["subnet"], strict=False)
+        lines.append(f'subnet {network.network_address} netmask {network.netmask} {{')
+        lines.append(f'    authoritative;')
+        lines.append(f'    option routers {subnet["gateway"]};')
+        dns = subnet.get("dns_servers") or []
+        if dns:
+            lines.append(f'    option domain-name-servers {", ".join(dns)};')
+        lines.append(f'')
+
+        # --- Pool grouping by shared range ---
+        groups = group_classes_by_range(v4_classes, "ipv4")
+        for rng, members in groups:
+            start, end = parse_ipv4_range(rng, members[0]["name"])
+            mtu_set = {(m.get("options") or {}).get("interface_mtu") for m in members}
+            mtu_set.discard(None)
+            # pool-scoped lease params taken from FIRST member that defines them
+            # (warn if siblings disagree)
+            lease_set = [resolve_lease_params(m, lease_profiles, "ipv4") for m in members]
+            lease_pool = next((l for l in lease_set if l), None)
+            if lease_pool and any(l != lease_pool for l in lease_set if l):
+                warn(f"Pool {rng} contains classes with different lease_profiles; "
+                     f"using profile from '{members[0]['name']}'")
+
+            if len(members) == 1:
+                lines.append(f'    # Pool for {members[0]["name"]}')
+            else:
+                names = ", ".join(m["name"] for m in members)
+                lines.append(f'    # Shared pool: {names}')
+            lines.append(f'    pool {{')
+            for m in members:
+                lines.append(f'        allow members of "{m["name"]}";')
+            lines.append(f'        range {start} {end};')
+            if lease_pool:
+                if "default_lease_time" in lease_pool:
+                    lines.append(f'        default-lease-time {lease_pool["default_lease_time"]};')
+                if "max_lease_time" in lease_pool:
+                    lines.append(f'        max-lease-time {lease_pool["max_lease_time"]};')
+            if mtu_set:
+                # If multiple MTUs disagree, warn but pick first deterministic one
+                if len(mtu_set) > 1:
+                    warn(f"Pool {rng} has classes with conflicting interface_mtu values "
+                         f"({mtu_set}); using {sorted(mtu_set)[0]}")
+                lines.append(f'        option interface-mtu {sorted(mtu_set)[0]};')
+            lines.append(f'    }}')
+            lines.append(f'')
+        lines.append(f'}}')
+
+    return "\n".join(lines) + "\n"
+
+
+def gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles):
+    g = cfg["global"]
+    subnets = cfg["subnets"]["ipv6"]
+    classes = cfg["oru_classes"]
+    eid     = g["oran_enterprise_id"]
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
+    V6_OFFSET = 6
+
+    lines = [
+        f"# dhcpd6.conf",
+        f"# Generated by oran-dhcp-gen v{__version__} on {ts}",
+        f"# Source: oran_dhcp.yaml  |  DO NOT EDIT MANUALLY",
+        f"",
+        f"default-lease-time {g['default_lease_time']};",
+        f"max-lease-time {g['max_lease_time']};",
+        f"",
+        f"authoritative;",
+        f"",
+        f"option dhcp6.vendor-class code 16 = string;",
+        f"option dhcp6.vendor-opts code 17 = {{ integer 32, string }};",
+        f"",
+        f'log(info, concat("Vendor Class (hex): ",'
+        f' binary-to-ascii(16, 8, ":", option dhcp6.vendor-class)));',
+        f'log(info, concat("Vendor Class String: ",'
+        f' substring(option dhcp6.vendor-class, 6, 33)));',
+        f"",
+    ]
+
+    v6_classes = [c for c in classes if "ipv6_range" in c]
+
+    # --- Class declarations ---
+    for cls in v6_classes:
+        name      = cls["name"]
+        prefix    = cls["match_prefix"]
+        match_len = len(prefix)
+        ctrl      = controllers[cls["controller"]]
+        protocol  = cls["protocol"]
+        chunks, _, _ = resolve_tlv("ipv6", cls, controllers, ca_ra_profiles)
+        lease     = resolve_lease_params(cls, lease_profiles, "ipv6")
+
+        lines.append(f'class "{name}" {{')
+        if prefix == "":
+            lines.append(f'    match if substring(option dhcp6.vendor-class, 0, 0) = "";')
+            lines.append(f'    log (info, "Matched {name} class");')
+            lines.append(f'    log (info, concat("Unmatched Vendor Class String: ",'
+                         f' substring(option dhcp6.vendor-class, 6, 33)));')
+        else:
+            lines.append(f'    match if substring(option dhcp6.vendor-class,'
+                         f' {V6_OFFSET}, {match_len}) = "{prefix}";')
+            lines.append(f'    log (info, "Matched {name} class");')
+        lines.append(f'    # Controller: {cls["controller"]} ({ctrl["ipv6"]}) protocol: {protocol}')
+        lines.extend(format_isc_option_chain("dhcp6.vendor-opts",
+                                             chunks, eid=eid))
+        # T1/T2 are options — work inside class blocks
+        if lease and "renewal_time" in lease:
+            lines.append(f'    option dhcp-renewal-time {lease["renewal_time"]};')
+        if lease and "rebinding_time" in lease:
+            lines.append(f'    option dhcp-rebinding-time {lease["rebinding_time"]};')
+        lines.append(f'}}')
+        lines.append(f'')
+
+    # --- Subnets ---
+    for subnet in subnets:
+        net = subnet["subnet"]
+        dns = subnet.get("dns_servers") or []
+        lines.append(f'subnet6 {net} {{')
+        if dns:
+            lines.append(f'    option dhcp6.name-servers {", ".join(dns)};')
+        lines.append(f'')
+
+        groups = group_classes_by_range(v6_classes, "ipv6")
+        for rng, members in groups:
+            start, end = parse_ipv6_range(rng, members[0]["name"])
+            lease_set = [resolve_lease_params(m, lease_profiles, "ipv6") for m in members]
+            lease_pool = next((l for l in lease_set if l), None)
+            if lease_pool and any(l != lease_pool for l in lease_set if l):
+                warn(f"IPv6 pool {rng} contains classes with different lease_profiles; "
+                     f"using profile from '{members[0]['name']}'")
+
+            if len(members) == 1:
+                lines.append(f'    # Pool for {members[0]["name"]}')
+            else:
+                names = ", ".join(m["name"] for m in members)
+                lines.append(f'    # Shared pool: {names}')
+            lines.append(f'    pool6 {{')
+            for m in members:
+                lines.append(f'        allow members of "{m["name"]}";')
+            lines.append(f'        range6 {start} {end};')
+            if lease_pool:
+                # Pool-scoped lease parameters — these actually take effect
+                if "default_lease_time" in lease_pool:
+                    lines.append(f'        default-lease-time {lease_pool["default_lease_time"]};')
+                if "max_lease_time" in lease_pool:
+                    lines.append(f'        max-lease-time {lease_pool["max_lease_time"]};')
+                if "preferred_lifetime" in lease_pool:
+                    lines.append(f'        preferred-lifetime {lease_pool["preferred_lifetime"]};')
+            lines.append(f'    }}')
+            lines.append(f'')
+        lines.append(f'}}')
+
+    return "\n".join(lines) + "\n"
+
+
+def gen_isc_defaults(cfg):
+    v4_ifaces = list(dict.fromkeys(
+        s["interface"] for s in cfg["subnets"]["ipv4"] if "interface" in s))
+    v6_ifaces = list(dict.fromkeys(
+        s["interface"] for s in cfg["subnets"]["ipv6"] if "interface" in s))
+    if not v4_ifaces:
+        die("subnets.ipv4 entries must include an 'interface' field")
+    if not v6_ifaces:
+        die("subnets.ipv6 entries must include an 'interface' field")
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"# isc-dhcp-server",
+        f"# Generated by oran-dhcp-gen v{__version__} on {ts}",
+        f"# Source: oran_dhcp.yaml  |  DO NOT EDIT MANUALLY",
+        f"# Install to: /etc/default/isc-dhcp-server",
+        f"",
+        f"#DHCPDv4_CONF=/etc/dhcp/dhcpd.conf",
+        f"#DHCPDv6_CONF=/etc/dhcp/dhcpd6.conf",
+        f"#DHCPDv4_PID=/var/run/dhcpd.pid",
+        f"#DHCPDv6_PID=/var/run/dhcpd6.pid",
+        f'#OPTIONS=""',
+        f"",
+        f'INTERFACESv4="{" ".join(v4_ifaces)}"',
+        f'INTERFACESv6="{" ".join(v6_ifaces)}"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Kea DHCP generators
+# ---------------------------------------------------------------------------
+
+def _kea_class_lifetimes(cls, lease_profiles, family):
+    """Return per-client-class lifetime entries for Kea."""
+    lp = resolve_lease_params(cls, lease_profiles, family)
+    if not lp:
+        return {}
+    out = {}
+    if "default_lease_time" in lp:
+        out["valid-lifetime"] = lp["default_lease_time"]
+    if "max_lease_time" in lp:
+        out["max-valid-lifetime"] = lp["max_lease_time"]
+    if family == "ipv6" and "preferred_lifetime" in lp:
+        out["preferred-lifetime"] = lp["preferred_lifetime"]
+    return out
+
+
+def gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles):
+    g       = cfg["global"]
+    subnets = cfg["subnets"]["ipv4"]
+    classes = cfg["oru_classes"]
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    v4_classes = [c for c in classes if "ipv4_range" in c]
+    named_classes  = [c for c in v4_classes if c["match_prefix"] != ""]
+    catchall_class = next((c for c in v4_classes if c["match_prefix"] == ""), None)
+
+    kea_classes = []
+
+    all_class_subs = []   # collected for option-def emission
+
+    def _build_class_entry(cls, test_expr):
+        subs = resolve_suboptions("ipv4", cls, controllers, ca_ra_profiles)
+        all_class_subs.append(subs)
+        mtu = (cls.get("options") or {}).get("interface_mtu")
+        od = [{"name": "vendor-encapsulated-options", "always-send": True}]
+        for s in subs:
+            name, _types = KEA_SUBOPT_DEFS[s["code"]]
+            od.append({
+                "name":  name,
+                "space": "vendor-encapsulated-options-space",
+                "data":  _kea_escape_data(s),
+            })
+        entry = {
+            "name": cls["name"],
+            "test": test_expr,
+            "option-data": od,
+        }
+        if mtu:
+            entry["option-data"].append({"name": "interface-mtu", "data": str(mtu)})
+        # Per-class lifetimes (new in 2.2.0)
+        entry.update(_kea_class_lifetimes(cls, lease_profiles, "ipv4"))
+        return entry
+
+    for cls in named_classes:
+        prefix    = cls["match_prefix"]
+        match_len = len(prefix)
+        test_expr = f"substring(option[60].hex, 0, {match_len}) == '{prefix}'"
+        kea_classes.append(_build_class_entry(cls, test_expr))
+
+    if catchall_class:
+        not_expr = " and ".join(f"not member('{c['name']}')" for c in named_classes)
+        kea_classes.append(_build_class_entry(
+            catchall_class, not_expr if not_expr else "true"))
+
+    # Subnets with grouped pools
+    kea_subnets = []
+    for sid, subnet in enumerate(subnets, start=1):
+        groups = group_classes_by_range(v4_classes, "ipv4")
+        pools = []
+        for rng, members in groups:
+            start, end = parse_ipv4_range(rng, members[0]["name"])
+            if len(members) == 1:
+                pools.append({"pool": f"{start} - {end}", "client-class": members[0]["name"]})
+            else:
+                # Kea: combine via 'client-class' and a synthesized 'allow' list
+                # via 'evaluate-additional-classes' isn't 1:1, but using
+                # 'require-client-classes' + an OR test is common; simplest is to
+                # emit one pool entry per member (Kea unions them for selection).
+                for m in members:
+                    pools.append({"pool": f"{start} - {end}", "client-class": m["name"]})
+
+        subnet_entry = {
+            "id": sid,
+            "subnet": subnet["subnet"],
+            "pools": pools,
+            "interface": subnet.get("interface", ""),
+            "option-data": [],
+        }
+        if subnet.get("gateway"):
+            subnet_entry["option-data"].append({"name": "routers", "data": subnet["gateway"]})
+        if subnet.get("dns_servers"):
+            subnet_entry["option-data"].append({
+                "name": "domain-name-servers",
+                "data": ", ".join(subnet["dns_servers"]),
+            })
+        kea_subnets.append(subnet_entry)
+
+    kea_cfg = {
+        "Dhcp4": {
+            "user-context": {
+                "comment": f"Generated by oran-dhcp-gen v{__version__} on {ts}",
+                "source": "oran_dhcp.yaml",
+                "warning": "DO NOT EDIT MANUALLY",
+            },
+            "interfaces-config": {
+                "interfaces": list(dict.fromkeys(
+                    s.get("interface", "") for s in subnets if s.get("interface")
+                ))
+            },
+            "lease-database": {
+                "type": "memfile",
+                "persist": True,
+                "name": "/var/lib/kea/kea-leases4.csv",
+            },
+            "valid-lifetime": g["default_lease_time"],
+            "max-valid-lifetime": g["max_lease_time"],
+            "option-def": kea_option_defs_for(
+                "ipv4", "vendor-encapsulated-options-space", all_class_subs),
+            "client-classes": kea_classes,
+            "subnet4": kea_subnets,
+            "loggers": [{
+                "name": "kea-dhcp4",
+                "output_options": [{"output": "/var/log/kea/kea-dhcp4.log"}],
+                "severity": "INFO",
+            }],
+        }
+    }
+    return json.dumps(kea_cfg, indent=4) + "\n"
+
+
+def gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles):
+    g       = cfg["global"]
+    subnets = cfg["subnets"]["ipv6"]
+    classes = cfg["oru_classes"]
+    eid     = g["oran_enterprise_id"]
+    ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    v6_classes = [c for c in classes if "ipv6_range" in c]
+    named_classes  = [c for c in v6_classes if c["match_prefix"] != ""]
+    catchall_class = next((c for c in v6_classes if c["match_prefix"] == ""), None)
+
+    kea_classes = []
+
+    all_class_subs = []   # collected for option-def emission
+
+    def _build_class_entry(cls, test_expr):
+        subs = resolve_suboptions("ipv6", cls, controllers, ca_ra_profiles)
+        all_class_subs.append(subs)
+        # vendor-opts is Kea's standard option 17; forcing it with the
+        # enterprise number guarantees emission even if the client's ORO
+        # omits option 17.
+        od = [{"name": "vendor-opts", "data": str(eid), "always-send": True}]
+        for s in subs:
+            name, _types = KEA_SUBOPT_DEFS[s["code"]]
+            od.append({
+                "name":        name,
+                "space":       f"vendor-{eid}",
+                "data":        _kea_escape_data(s),
+                "always-send": True,
+            })
+        entry = {
+            "name": cls["name"],
+            "test": test_expr,
+            "option-data": od,
+        }
+        entry.update(_kea_class_lifetimes(cls, lease_profiles, "ipv6"))
+        return entry
+
+    for cls in named_classes:
+        prefix    = cls["match_prefix"]
+        match_len = len(prefix)
+        test_expr = f"substring(vendor-class[{eid}].data[0], 0, {match_len}) == '{prefix}'"
+        kea_classes.append(_build_class_entry(cls, test_expr))
+
+    if catchall_class:
+        not_expr = " and ".join(f"not member('{c['name']}')" for c in named_classes)
+        kea_classes.append(_build_class_entry(
+            catchall_class, not_expr if not_expr else "true"))
+
+    kea_subnets = []
+    for sid, subnet in enumerate(subnets, start=1):
+        groups = group_classes_by_range(v6_classes, "ipv6")
+        pools = []
+        for rng, members in groups:
+            start, end = parse_ipv6_range(rng, members[0]["name"])
+            for m in members:
+                pools.append({"pool": f"{start} - {end}", "client-class": m["name"]})
+
+        subnet_entry = {
+            "id": sid,
+            "subnet": subnet["subnet"],
+            "pools": pools,
+            "interface": subnet.get("interface", ""),
+            "option-data": [],
+        }
+        if subnet.get("dns_servers"):
+            subnet_entry["option-data"].append({
+                "name": "dns-servers",
+                "data": ", ".join(subnet["dns_servers"]),
+            })
+        kea_subnets.append(subnet_entry)
+
+    kea_cfg = {
+        "Dhcp6": {
+            "user-context": {
+                "comment": f"Generated by oran-dhcp-gen v{__version__} on {ts}",
+                "source": "oran_dhcp.yaml",
+                "warning": "DO NOT EDIT MANUALLY",
+            },
+            "interfaces-config": {
+                "interfaces": list(dict.fromkeys(
+                    s.get("interface", "") for s in subnets if s.get("interface")
+                ))
+            },
+            "lease-database": {
+                "type": "memfile",
+                "persist": True,
+                "name": "/var/lib/kea/kea-leases6.csv",
+            },
+            "valid-lifetime": g["default_lease_time"],
+            "max-valid-lifetime": g["max_lease_time"],
+            "option-def": kea_option_defs_for(
+                "ipv6", f"vendor-{eid}", all_class_subs),
+            "client-classes": kea_classes,
+            "subnet6": kea_subnets,
+            "loggers": [{
+                "name": "kea-dhcp6",
+                "output_options": [{"output": "/var/log/kea/kea-dhcp6.log"}],
+                "severity": "INFO",
+            }],
+        }
+    }
+    return json.dumps(kea_cfg, indent=4) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Deploy helpers
+# ---------------------------------------------------------------------------
+
+DEPLOY_PATHS = {
+    "dhcpd.conf":       Path("/etc/dhcp/dhcpd.conf"),
+    "dhcpd6.conf":      Path("/etc/dhcp/dhcpd6.conf"),
+    "isc-dhcp-server":  Path("/etc/default/isc-dhcp-server"),
+    "kea-dhcp4.conf":   Path("/etc/kea/kea-dhcp4.conf"),
+    "kea-dhcp6.conf":   Path("/etc/kea/kea-dhcp6.conf"),
+}
+
+RESTART_SERVICES = {
+    "isc": ["isc-dhcp-server", "isc-dhcp-server6"],
+    "kea": ["kea-dhcp4-server", "kea-dhcp6-server"],
+}
+
+
+def backup_file(dest):
+    if not dest.exists():
+        return None
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = dest.with_suffix(f"{dest.suffix}.bak.{ts}")
+    import shutil
+    shutil.copy2(dest, backup)
+    return backup
+
+
+def deploy_file(src, dest):
+    import shutil
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_file(dest)
+    shutil.copy2(src, dest)
+    return backup
+
+
+def restart_services(target):
+    import subprocess
+    services = []
+    if target in ("isc", "all"):
+        services += RESTART_SERVICES["isc"]
+    if target in ("kea", "all"):
+        services += RESTART_SERVICES["kea"]
+    for svc in services:
+        print(f"[INFO] Restarting {svc} ...")
+        result = subprocess.run(["systemctl", "restart", svc],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"[OK]   {svc} restarted successfully")
+        else:
+            print(f"[WARN] {svc} restart failed: {result.stderr.strip()}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"O-RAN DHCP Configuration Generator v{__version__}"
+    )
+    parser.add_argument("input", help="Path to oran_dhcp.yaml")
+    parser.add_argument("--target", choices=["isc", "kea", "all"], default="isc",
+                        help="Output target: isc, kea, or all (default: isc)")
+    parser.add_argument("--outdir", default=None,
+                        help="Output directory (default: temp dir with --deploy, "
+                             "current dir otherwise)")
+    parser.add_argument("--deploy", action="store_true",
+                        help="Deploy generated configs to system paths "
+                             "with timestamped backups")
+    parser.add_argument("--restart", action="store_true",
+                        help="Restart DHCP service(s) after deploy")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}")
+    args = parser.parse_args()
+
+    if args.restart and not args.deploy:
+        die("--restart requires --deploy to be specified")
+
+    yaml_path = Path(args.input)
+    if not yaml_path.exists():
+        die(f"Input file not found: {yaml_path}")
+    with open(yaml_path) as f:
+        cfg = yaml.safe_load(f)
+    print(f"[INFO] Loaded: {yaml_path}")
+
+    controllers, lease_profiles, ca_ra_profiles = validate(cfg)
+
+    if args.deploy and args.outdir is None:
+        import tempfile
+        outdir = Path(tempfile.mkdtemp(prefix="oran-dhcp-gen-"))
+        print(f"[INFO] Using temp directory: {outdir}")
+    else:
+        outdir = Path(args.outdir or ".")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    generated = []
+
+    if args.target in ("isc", "all"):
+        for fname, gen_func in (
+            ("dhcpd.conf",      lambda: gen_isc_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("dhcpd6.conf",     lambda: gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("isc-dhcp-server", lambda: gen_isc_defaults(cfg)),
+        ):
+            out = outdir / fname
+            out.write_text(gen_func())
+            print(f"[OK] Generated: {out}")
+            generated.append((fname, out))
+
+    if args.target in ("kea", "all"):
+        for fname, gen_func in (
+            ("kea-dhcp4.conf",  lambda: gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("kea-dhcp6.conf",  lambda: gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
+        ):
+            out = outdir / fname
+            out.write_text(gen_func())
+            print(f"[OK] Generated: {out}")
+            generated.append((fname, out))
+
+    print(f"\n[DONE] Output written to: {outdir}/")
+
+    if args.deploy:
+        print(f"\n{'='*60}\n[DEPLOY] Deploying {len(generated)} file(s) ...\n{'='*60}")
+        deploy_ok = True
+        for filename, src in generated:
+            dest = DEPLOY_PATHS.get(filename)
+            if dest is None:
+                print(f"[WARN]  No deploy path for: {filename}")
+                continue
+            try:
+                backup = deploy_file(src, dest)
+                if backup:
+                    print(f"[OK]   {dest}\n       └─ backed up → {backup}")
+                else:
+                    print(f"[OK]   {dest}  (new file)")
+            except PermissionError:
+                print(f"[ERROR] Permission denied: {dest}  (need sudo)")
+                deploy_ok = False
+            except Exception as e:
+                print(f"[ERROR] Failed to deploy {dest}: {e}")
+                deploy_ok = False
+
+        if not deploy_ok:
+            print(f"\n[WARN] Deploy completed with errors")
+        else:
+            print(f"\n[OK]   All files deployed successfully")
+
+        if args.restart and deploy_ok:
+            print(f"\n{'='*60}\n[RESTART] Restarting DHCP service(s) ...\n{'='*60}")
+            restart_services(args.target)
+
+
+if __name__ == "__main__":
+    main()

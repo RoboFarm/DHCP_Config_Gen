@@ -1,0 +1,108 @@
+# oran_dhcp.yaml
+# Generic O-RAN DHCP deployment data model
+# Version: 0.2.0
+#
+# This file is the single source of truth for DHCP configuration.
+# A config generator reads this and produces server-specific configs
+# for ISC DHCP, Kea, dnsmasq, etc.
+#
+# Changelog:
+# 0.1.0 - Initial draft
+# 0.2.0 - match_length auto-derived from match_prefix (removed from model)
+#          Simplified IP range notation: "x.x.x.100-109" / "::100-109"
+#          Moved protocol (ssh/tls) to per-class level
+
+# ---------------------------------------------------------------------------
+# Global settings
+# ---------------------------------------------------------------------------
+global:
+  default_lease_time: 43200      # 12 hours (seconds)
+  max_lease_time: 86400          # 24 hours (seconds)
+  oran_enterprise_id: 53148      # O-RAN Alliance IANA enterprise number
+
+# ---------------------------------------------------------------------------
+# Controllers
+# Defines O-RU controllers signalled via DHCP options.
+# protocol is NOT set here - it is set per O-RU class below.
+# ---------------------------------------------------------------------------
+controllers:
+  - name: ctrl_primary
+    description: "Primary O-RU controller"
+    ipv4: "192.168.44.6"
+    ipv6: "fd00:8b36:f2a9::2c:6"
+
+  - name: ctrl_att
+    description: "ATT-specific controller"
+    ipv4: "192.168.44.6"
+    ipv6: "fd00:8b36:f2a9::2c:6"
+    # Optional TLS CA settings (uncomment if ATT O-RUs require PKI enrolment)
+    # tls_ca:
+    #   ipv6: "fd00:8b36:f2a9::95:240"
+    #   port: 8091
+    #   path: "/pkix/"
+    #   subject_name: "/OU=SPM/O=1Finity/C=US/CN=ATT-SSL/L=WV/ST=Texas"
+    #   protocol: http
+
+# ---------------------------------------------------------------------------
+# O-RU classes
+#
+# match_prefix  : vendor-class-identifier prefix string to match
+#                 match_length is auto-derived as len(match_prefix)
+#                 use "" for the catch-all Unmatched class
+#
+# controller    : references a controller name defined above
+#
+# protocol      : ssh or tls (per-class)
+#                 ssh  -> option 43 TLV: 0x81 (controller IP only)
+#                 tls  -> option 43 TLV: 0x81 (controller IP) + 0x86 0x01 0x01
+#
+# ipv4_range    : "A.B.C.start-end"  e.g. "192.168.36.100-109"
+# ipv6_range    : "prefix::start-end" e.g. "fd00:8b36:f2a9::100-109"
+#
+# options       : optional per-class DHCP option overrides
+# ---------------------------------------------------------------------------
+oru_classes:
+
+  - name: ATTn77
+    description: "ATT n77 band RU (44R14 series)"
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    controller: ctrl_att
+    protocol: ssh                          # change to tls to enable NETCONF over TLS
+    ipv4_range: "192.168.44.160-169"
+    ipv6_range: "fd00:8b36:f2a9::160-169"
+
+  - name: ATTn25n66
+    description: "ATT n25/n66 band RU (44R26 series)"
+    match_prefix: "o-ran-ru2/FJ/44R26"
+    controller: ctrl_att
+    protocol: ssh
+    ipv4_range: "192.168.44.170-179"
+    ipv6_range: "fd00:8b36:f2a9::170-179"
+
+  # Catch-all — always keep this last
+  - name: Unmatched
+    description: "Fallback for unrecognised vendor class"
+    match_prefix: ""
+    controller: ctrl_primary
+    protocol: ssh
+    ipv4_range: "192.168.44.180-189"
+    ipv6_range: "fd00:8b36:f2a9::180-199"
+    options:
+      interface_mtu: 1440
+
+# ---------------------------------------------------------------------------
+# Subnets
+# ---------------------------------------------------------------------------
+subnets:
+  ipv4:
+    - subnet: "192.168.44.0/24"
+      gateway: "192.168.44.1"
+      dns_servers:
+        - "192.168.44.1"
+      interface: "br-mplane"
+
+  ipv6:
+    - subnet: "fd00:8b36:f2a9::/64"
+      dns_servers:
+        - "fd00:8b36:f2a9::1"
+      interface: "br-mplane"
