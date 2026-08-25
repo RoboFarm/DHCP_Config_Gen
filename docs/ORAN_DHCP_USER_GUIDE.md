@@ -1,8 +1,8 @@
 # O-RAN DHCP Tools — User Guide
 
-**Version:** 4.1.0
-**Last Updated:** 2026-08-24
-**Packages Covered:** `oran-dhcp-gen` v2.4.0 · `dhcp-oru-toolkit` v2.1.2
+**Version:** 4.2.0
+**Last Updated:** 2026-08-25
+**Packages Covered:** `oran-dhcp-gen` v2.5.0 · `dhcp-oru-toolkit` v2.1.2
 
 > The lease viewer was renamed. `dhcp-lease-list` 1.3.0 became the
 > `dhcp-oru-toolkit` package at 2.0.0, which ships `dhcp-lease-list` and
@@ -324,6 +324,7 @@ oru_classes:
 | `ipv6_range` | **Optional since 2.2.0** | Omit to disable IPv6 for this class. **At least one range must be present** |
 | `lease_profile` | No | Name from `lease_profiles` |
 | `ca_ra` | No | CA/RA block; requires `profile` and `port`. Ignored unless `protocol: tls` |
+| `ca_ra.port` | Yes, inside `ca_ra` | CA/RA server port (sub-option 0x03). An integer for both families, or **since 2.5.0** a mapping `{ipv4: N, ipv6: M}` when the CA is reached on a different port per family |
 | `ca_ra.mplane_fqdn` | No | Emits sub-option 0x82 |
 | `ca_ra.include_controller_ip` | No | Default `true`; set `false` to omit sub-option 0x81 |
 | `options.interface_mtu` | No | Sets DHCP option 26 (MTU), IPv4 only |
@@ -373,7 +374,7 @@ Sub-option codes are the same for both families. Only the header differs: DHCPv4
 | Code | Field | Type | Source |
 |---|---|---|---|
 | `0x01` | CA server IP | address | `ca_ra_profile.ca_server_ipv4` / `ca_server_ipv6` |
-| `0x03` | CA port | uint16 | `class.ca_ra.port` |
+| `0x03` | CA port | uint16 | `class.ca_ra.port` — scalar, or per-family `{ipv4, ipv6}` |
 | `0x04` | URI path | string | `ca_ra_profile.uri_path` |
 | `0x05` | Subject DN | string | `ca_ra_profile.subject_dn` |
 | `0x06` | App protocol | string | `ca_ra_profile.app_protocol` |
@@ -394,6 +395,26 @@ Adding `callhome_port` appends 0x87 to whichever chain the class emits — `…:
 > **Set `callhome_port` whenever you set `protocol: tls`.** Sub-option 0x86 tells the O-RU to use TLS; nothing in the chain tells it *which port* unless 0x87 is present, so it falls back to its firmware default. On the Fujitsu units in the lab that default is 4334 — the SSH call-home port — so the O-RU opens a TLS connection to the SSH listener and call-home never completes. The DHCP lease is fine and the config validates, which makes this look like an O-RU fault rather than a DHCP one. `callhome_port: auto` picks 4335 from `protocol: tls` and removes the question.
 
 **CA/RA form** — a `protocol: tls` class with a `ca_ra` block emits the full chain in code order: 0x01, 0x03, 0x04, 0x05, 0x06, then 0x81 (unless `include_controller_ip: false`), 0x82 (if `mplane_fqdn` set), 0x86, and 0x87 last (if `callhome_port` set).
+
+**Per-family CA/RA port.** `ca_ra.port` is normally one number used for both families:
+
+```yaml
+    ca_ra:
+      profile: onefinity_ca
+      port: 8080
+```
+
+Some deployments front the same CMP endpoint on a different port per family. Give `port` a mapping instead:
+
+```yaml
+    ca_ra:
+      profile: onefinity_ca
+      port:
+        ipv4: 8081
+        ipv6: 8080
+```
+
+Sub-option 0x03 then carries 8081 in `dhcpd.conf` / `kea-dhcp4.conf` and 8080 in `dhcpd6.conf` / `kea-dhcp6.conf`. If the mapping omits a family the class actually serves — an `ipv4_range` is present but no `ipv4` port — generation fails rather than falling back, because a silent fallback sends the wrong port to that family and the O-RU's CMP enrolment fails with a config that still validates.
 
 Chains of three or more sub-options are emitted across multiple lines in the ISC configs, one sub-option per line. This is a readability change only — ISC `dhcpd` parses both forms identically and the wire bytes are the same:
 
@@ -925,6 +946,7 @@ sudo systemctl restart isc-dhcp-server
 
 | Version | Changes |
 |---------|---------|
+| 2.5.0 | **`ca_ra.port` accepts a per-family mapping** `{ipv4: N, ipv6: M}` for CAs reached on a different port per family; a scalar still means "both families". A mapping missing a family the class serves is rejected, not defaulted. Added `References/isc/Lab01` — a second lab's hand-written ISC configs plus the YAML that reproduces them — and a test that decodes both and requires the generated sub-option chains to match per class per family. Fixed the test helpers, which decoded a commented-out alternative chain when one sat above the live one |
 | 2.4.0 | **`callhome_port` on a class emits sub-option `0x87`**, the NETCONF call-home port — an integer or `auto` (SSH 4334, TLS 4335). Previously a class could say "use TLS" via `0x86` but not say which port, so O-RUs fell back to the firmware default of 4334 and TLS call-home never completed. Opt-in: a model that omits it is byte-identical to 2.3.0. Kea DHCPv4 now also emits T1/T2 (options 58/59) from a `lease_profile`, which it had been dropping while ISC emitted them. A `tls_ca:` block on a controller — never an implemented field, but sketched in the Lab4 reference YAML — is now a hard error pointing at `ca_ra_profiles`, and unknown fields warn instead of being silently ignored |
 | 2.3.0 | `--no-timestamp` for byte-reproducible output. Malformed or empty YAML now fails with a message rather than a traceback. Repo restructured (`bin/`, `packaging/`, `tests/`, `examples/`, `docs/`); the version is substituted from `__version__` at build time instead of living in five hand-edited places; test suite added |
 | 2.2.3 | **Fixed Kea option 43/17 encoding** (regression from 2.2.0). Payload had been emitted as one binary blob under sub-option `0x01`, which Kea wrapped in its own TLV — O-RUs never learned the controller IP although the config validated cleanly. Kea now emits typed `option-def` / `option-data` per O-RAN sub-option and builds the TLVs itself, matching ISC wire bytes. DHCPv6 `vendor-opts` container forced with `always-send`. Added a generation-time cross-check that re-encodes the Kea representation and aborts on any divergence from the ISC bytes. Commas in string sub-option values escaped for Kea. ISC output unchanged |

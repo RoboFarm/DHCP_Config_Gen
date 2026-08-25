@@ -107,3 +107,5 @@ Pipeline inside the script: `validate()` → range parsers → **TLV resolution*
 - The catch-all class uses `match_prefix: ""` and **must be last**; ISC matches it via an empty substring, Kea via `not member(...)` of every other class.
 - Ranges use hyphens, not tildes: `192.168.44.160-169`, `fd00:8b36:f2a9::160-169`.
 - A `ca_ra` block on a class only takes effect when `protocol: tls`.
+- `ca_ra.port` is either a scalar (both families) or `{ipv4: N, ipv6: M}`. Lab01 fronts one CMP endpoint on a different port per family, so a scalar there would put the v4 port into the v6 chain. A mapping missing a family the class serves is a `die()`, never a fallback.
+- `References/isc/Lab01/` pairs a second lab's hand-written ISC configs with the `oran_dhcp.yaml` that reproduces them; `test_generator_reproduces_lab01_vendor_chains` decodes both and compares sub-option chains per class per family. Like Lab03 these are the semantic target, not byte-exact output. Note both labs keep a commented-out alternative chain directly above the live one — decode helpers must anchor at line start or they read the comment.

@@ -54,7 +54,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -249,6 +249,37 @@ def validate(cfg):
                 die(f"oru_class '{name}' ca_ra references undefined profile: '{ca_ra['profile']}'")
             if "port" not in ca_ra:
                 die(f"oru_class '{name}' ca_ra block missing required field: 'port'")
+
+            # port: a scalar for both families, or {ipv4: N, ipv6: M}. The
+            # mapping form exists because a CA can front the same CMP endpoint
+            # on a different port per family; a scalar would quietly send the
+            # v4 port to v6 clients.
+            def _check_port(value, where):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    die(f"oru_class '{name}' {where} must be an integer "
+                        f"1-65535, got: {value!r}")
+                if not 1 <= value <= 65535:
+                    die(f"oru_class '{name}' {where} out of range: {value} "
+                        f"(must be 1-65535)")
+
+            port = ca_ra["port"]
+            if isinstance(port, dict):
+                unknown = set(port) - {"ipv4", "ipv6"}
+                if unknown:
+                    die(f"oru_class '{name}' ca_ra.port has unknown key(s): "
+                        f"{', '.join(sorted(unknown))} — expected 'ipv4' and/or "
+                        f"'ipv6'")
+                if not port:
+                    die(f"oru_class '{name}' ca_ra.port mapping is empty")
+                for fam, range_key in (("ipv4", "ipv4_range"), ("ipv6", "ipv6_range")):
+                    if range_key in cls and fam not in port:
+                        die(f"oru_class '{name}' serves {fam} (has {range_key}) "
+                            f"but ca_ra.port defines no '{fam}' port. Add it, or "
+                            f"use a single scalar port for both families.")
+                    if fam in port:
+                        _check_port(port[fam], f"ca_ra.port.{fam}")
+            else:
+                _check_port(port, "ca_ra.port")
             for k in ca_ra:
                 if k not in KNOWN_CA_RA_KEYS:
                     warn(f"oru_class '{name}' ca_ra: unknown field '{k}' — "
@@ -385,6 +416,21 @@ def build_option17_chunks_simple(ctrl_ipv6, protocol, callhome_port=None):
 # ---------------------------------------------------------------------------
 
 
+def resolve_ca_ra_port(ca_ra_class, family):
+    """CA/RA server port (sub-option 0x03) for this family.
+
+    `port` is either a scalar -- one port for both families, the only form
+    before 2.5.0 -- or a mapping {ipv4: N, ipv6: M}.  Lab01 reaches the same
+    CMP endpoint on a different port per family (TDDn77 v4 8081 / v6 8080),
+    which a scalar cannot express: it would silently send the v4 port to v6
+    clients.  validate() has already checked shape and range.
+    """
+    port = ca_ra_class["port"]
+    if isinstance(port, dict):
+        return int(port[family])
+    return int(port)
+
+
 def _v4_subopt(code, value_bytes):
     """1-byte tag + 1-byte length + value (DHCPv4 vendor sub-option)."""
     if len(value_bytes) > 0xFF:
@@ -434,8 +480,8 @@ def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol,
             die(f"ca_ra_profile must define ca_server_ipv6 to emit IPv6 sub-options")
         chunks.append(subopt(0x01, ipaddress.IPv6Address(ca_ip).packed))
 
-    # 0x03: CA port
-    port = int(ca_ra_class["port"])
+    # 0x03: CA port (per-family since 2.5.0)
+    port = resolve_ca_ra_port(ca_ra_class, family)
     chunks.append(subopt(0x03, bytes([(port >> 8) & 0xFF, port & 0xFF])))
 
     # 0x04: URI path
@@ -571,7 +617,7 @@ def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol,
 
     subs = [
         _subopt_struct(0x01, ip_type, ca_ip),
-        _subopt_struct(0x03, "uint16", str(int(ca_ra_class["port"]))),
+        _subopt_struct(0x03, "uint16", str(resolve_ca_ra_port(ca_ra_class, family))),
         _subopt_struct(0x04, "string", profile["uri_path"]),
         _subopt_struct(0x05, "string", profile["subject_dn"]),
         _subopt_struct(0x06, "string", profile["app_protocol"]),

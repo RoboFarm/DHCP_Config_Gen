@@ -34,6 +34,15 @@ GOLDEN_DIR = os.path.join(TESTS_DIR, "golden")
 INPUTS = {
     "lab4": os.path.join(REPO_ROOT, "References", "kea", "Lab4", "oran_dhcp.yaml"),
     "example": os.path.join(REPO_ROOT, "examples", "oran_dhcp.yaml.example"),
+    "lab01": os.path.join(REPO_ROOT, "References", "isc", "Lab01", "oran_dhcp.yaml"),
+}
+
+# The hand-written ISC configs a lab actually ran, paired with the model that
+# is supposed to reproduce them.  Compared by decoded sub-option chain, not by
+# bytes: these predate the generator and carry their own comments, logging and
+# line breaks.
+HANDWRITTEN = {
+    "lab01": os.path.join(REPO_ROOT, "References", "isc", "Lab01"),
 }
 OUTPUT_FILES = ("dhcpd.conf", "dhcpd6.conf", "isc-dhcp-server",
                 "kea-dhcp4.conf", "kea-dhcp6.conf")
@@ -76,8 +85,12 @@ def isc_v4_suboptions(block):
 
     DHCPv4 vendor sub-options are 1-byte code, 1-byte length, value.  The chain
     may be split across continuation lines, so it is collected up to the `;`.
+    Anchored at line start: hand-written lab configs keep the alternative
+    SSH/TLS chain commented out directly above the live one, and an unanchored
+    match reads the comment instead.
     """
-    m = re.search(r'option\s+vendor-encapsulated-options\s+(.*?);', block, re.S)
+    m = re.search(r'^[ \t]*option\s+vendor-encapsulated-options\s+(.*?);',
+                  block, re.S | re.M)
     if not m:
         return None
     raw = _hex_to_bytes(m.group(1))
@@ -95,7 +108,8 @@ def isc_v6_suboptions(block):
 
     DHCPv6 vendor sub-options are 2-byte code, 2-byte length, value.
     """
-    m = re.search(r'option\s+dhcp6\.vendor-opts\s+\d+\s+(.*?);', block, re.S)
+    m = re.search(r'^[ \t]*option\s+dhcp6\.vendor-opts\s+\d+\s+(.*?);',
+                  block, re.S | re.M)
     if not m:
         return None
     raw = _hex_to_bytes(m.group(1))
@@ -201,6 +215,10 @@ def test_golden_lab4():
 
 def test_golden_example():
     _check_golden("example")
+
+
+def test_golden_lab01():
+    _check_golden("lab01")
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +590,121 @@ def test_bad_callhome_port_is_rejected():
                 "callhome_port: %s produced a traceback" % value
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Reproducing a hand-written lab config
+# ---------------------------------------------------------------------------
+
+def test_generator_reproduces_lab01_vendor_chains():
+    """The generated chains must equal the ones Lab01 actually ran.
+
+    Lab01's dhcpd.conf / dhcpd6.conf came from the lab and predate the
+    generator, so the files differ in comments, logging and line breaks.  What
+    has to be identical is the decoded option-43 / option-17 sub-option chain
+    of every class on every family -- that is what reaches an O-RU.
+    """
+    src = os.path.join(HANDWRITTEN["lab01"], "oran_dhcp.yaml")
+    tmp = tempfile.mkdtemp(prefix="oran-gen-lab01-")
+    try:
+        generate_ok(src, tmp, "--no-timestamp")
+        for fname, decode in (("dhcpd.conf", isc_v4_suboptions),
+                              ("dhcpd6.conf", isc_v6_suboptions)):
+            ref = isc_class_blocks(
+                open(os.path.join(HANDWRITTEN["lab01"], fname)).read())
+            got = isc_class_blocks(open(os.path.join(tmp, fname)).read())
+            assert ref, "%s: no classes found in the hand-written config" % fname
+            for cls in sorted(ref):
+                assert cls in got, (
+                    "%s: hand-written config has class %r, generated does not"
+                    % (fname, cls))
+                want, have = decode(ref[cls]), decode(got[cls])
+                assert want == have, (
+                    "%s class %r: generated chain differs from the config the "
+                    "lab ran.\n  lab: %s\n  gen: %s"
+                    % (fname, cls,
+                       [(hex(c), v.hex(':')) for c, v in (want or [])],
+                       [(hex(c), v.hex(':')) for c, v in (have or [])]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ca_ra_port_can_differ_per_family():
+    """A per-family ca_ra.port must reach each family's chain separately.
+
+    Lab01 fronts the same CMP endpoint on a different port per family --
+    TDDn77 on v4 8081 / v6 8080.  Before 2.5.0 `port` was a single scalar used
+    for both, so this could not be expressed at all.
+    """
+    src = os.path.join(HANDWRITTEN["lab01"], "oran_dhcp.yaml")
+    tmp = tempfile.mkdtemp(prefix="oran-gen-port-fam-")
+    try:
+        generate_ok(src, tmp, "--no-timestamp")
+        expected = {                       # class -> (v4 port, v6 port)
+            "TDDn77":    (8081, 8080),
+            "FDDn25n66": (8083, 8082),
+        }
+        for cls, (want4, want6) in expected.items():
+            v4 = dict(isc_v4_suboptions(
+                isc_class_blocks(open(os.path.join(tmp, "dhcpd.conf")).read())[cls]))
+            v6 = dict(isc_v6_suboptions(
+                isc_class_blocks(open(os.path.join(tmp, "dhcpd6.conf")).read())[cls]))
+            assert _u16(v4[0x03]) == want4, (
+                "class %r: IPv4 CA port is %d, expected %d"
+                % (cls, _u16(v4[0x03]), want4))
+            assert _u16(v6[0x03]) == want6, (
+                "class %r: IPv6 CA port is %d, expected %d"
+                % (cls, _u16(v6[0x03]), want6))
+            assert want4 != want6, "this test is pointless if the ports match"
+
+        # Kea must carry the same split.
+        for fname, root, want_key in (("kea-dhcp4.conf", "Dhcp4", 0),
+                                      ("kea-dhcp6.conf", "Dhcp6", 1)):
+            data = kea_vendor_data_by_class(
+                json.load(open(os.path.join(tmp, fname))), root)
+            for cls, ports in expected.items():
+                assert int(data[cls][0x03]) == ports[want_key], (
+                    "%s class %r: CA port is %s, expected %d"
+                    % (fname, cls, data[cls][0x03], ports[want_key]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ca_ra_port_mapping_must_cover_every_served_family():
+    """A port mapping that omits a family the class serves must fail.
+
+    Silently falling back would send the wrong port to that family, which is
+    the failure the mapping exists to prevent.
+    """
+    model = _TLS_MODEL.replace(
+        "    callhome_port: auto\n",
+        "    ca_ra:\n"
+        "      profile: ca\n"
+        "      port:\n"
+        "        ipv6: 8080\n")            # Tls4 has an ipv4_range too
+    model = model.replace(
+        "lease_profiles:",
+        "ca_ra_profiles:\n"
+        "  ca:\n"
+        "    ca_server_ipv4: \"192.168.36.235\"\n"
+        "    ca_server_ipv6: \"fd00:8b36:f2a9::24:eb\"\n"
+        "    uri_path: \"/pkix/\"\n"
+        "    subject_dn: \"/CN=Test\"\n"
+        "    app_protocol: \"http\"\n"
+        "lease_profiles:")
+    tmp = tempfile.mkdtemp(prefix="oran-gen-portmap-")
+    try:
+        bad = _write_yaml(tmp, model)
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(bad, out, "--no-timestamp")
+        assert proc.returncode != 0, \
+            "a ca_ra.port mapping missing the ipv4 port must be rejected"
+        assert b"ipv4" in proc.stdout, \
+            "the error should name the missing family:\n%s" % proc.stdout.decode()
+        assert not os.listdir(out), "must not leave partial output"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

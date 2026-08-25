@@ -19,4 +19,5 @@ gen() {  # <name> <yaml>
 
 gen lab4    References/kea/Lab4/oran_dhcp.yaml
 gen example examples/oran_dhcp.yaml.example
+gen lab01   References/isc/Lab01/oran_dhcp.yaml
 echo ">> Done. Review with: git diff tests/golden/"
