@@ -1,3 +1,35 @@
+oran-dhcp-gen (2.8.1) stable; urgency=medium
+
+  * NEW References/kea/Lab4/oran_dhcp-tls.yaml -- the Lab4 model with NETCONF
+    call-home over TLS actually turned on, rather than only made expressible.
+    Everything the earlier releases added existed but was switched on nowhere
+    a lab deploys from: Lab4 was still every class on ssh with no CA/RA
+    profile at all.
+    The CA/RA settings are recovered from the commented-out 'tls_ca:' block
+    that shipped in oran_dhcp.yaml beside it -- CA IPv6 fd00:8b36:f2a9::95:240,
+    port 8091, /pkix/, the SPM subject DN, http. That block recorded no IPv4
+    CA address, so ca_server_ipv4 is a clearly marked placeholder and the file
+    says so at the top; run --explain and read the 0x01 line before deploying.
+    It is a separate file rather than a rewrite of oran_dhcp.yaml, which
+    records what the lab runs today and is a regression-test input.
+    The catch-all opts out of both the CA/RA block and 0x87 -- an unrecognised
+    O-RU has no business being pointed at a CA -- so its chain is byte-identical
+    to the SSH model, which a test pins.
+  * FIX a malformed address anywhere in the model surfaced as a raw
+    ipaddress.AddressValueError traceback instead of an [ERROR] line. It
+    reached ipaddress inside a TLV builder, well past validation, so nothing
+    said which field was wrong. Controller and CA/RA addresses are now parsed
+    during validate() and a bad one dies naming the field:
+
+      [ERROR] ca_ra_profile 'att_spm' ca_server_ipv4: 'REPLACE-ME' is not a
+              valid ipv4 address (Expected 4 octets in 'REPLACE-ME')
+
+    This matters more than it looks: the new TLS model ships a placeholder
+    address on purpose, and a placeholder that tracebacks is a placeholder
+    nobody can act on.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 15:20:00 +0000
+
 oran-dhcp-gen (2.8.0) stable; urgency=medium
 
   * NEW sub-option 0x02, CA/RA server FQDN, via a ca_ra_profile's

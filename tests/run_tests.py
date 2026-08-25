@@ -35,6 +35,7 @@ INPUTS = {
     "lab4": os.path.join(REPO_ROOT, "References", "kea", "Lab4", "oran_dhcp.yaml"),
     "example": os.path.join(REPO_ROOT, "examples", "oran_dhcp.yaml.example"),
     "lab01": os.path.join(REPO_ROOT, "References", "isc", "Lab01", "oran_dhcp.yaml"),
+    "lab4tls": os.path.join(REPO_ROOT, "References", "kea", "Lab4", "oran_dhcp-tls.yaml"),
 }
 
 # The hand-written ISC configs a lab actually ran, paired with the model that
@@ -219,6 +220,72 @@ def test_golden_example():
 
 def test_golden_lab01():
     _check_golden("lab01")
+
+
+def test_golden_lab4tls():
+    _check_golden("lab4tls")
+
+
+def test_lab4_tls_model_turns_tls_on_without_touching_the_catch_all():
+    """The TLS variant of Lab4 must enable TLS and leave Unmatched alone.
+
+    An unrecognised O-RU has no business being pointed at a CA, so the
+    catch-all opts out of both the CA/RA block and 0x87 and must stay
+    byte-identical to the SSH model it was derived from.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-l4tls-")
+    try:
+        generate_ok(INPUTS["lab4tls"], tmp, "--no-timestamp")
+        blocks = isc_class_blocks(open(os.path.join(tmp, "dhcpd.conf")).read())
+        for cls in ("ATTn77", "ATTn25n66"):
+            codes = [c for c, _ in isc_v4_suboptions(blocks[cls])]
+            assert codes == [0x01, 0x03, 0x04, 0x05, 0x06, 0x81, 0x86, 0x87], \
+                "%s should carry the full TLS chain, got %s" \
+                % (cls, [hex(c) for c in codes])
+            subs = dict(isc_v4_suboptions(blocks[cls]))
+            assert subs[0x86] == b"\x01", "%s should be TLS mode" % cls
+            assert _u16(subs[0x87]) == 4335, "%s should call home on 4335" % cls
+
+        ssh = tempfile.mkdtemp(prefix="oran-gen-l4ssh-")
+        try:
+            generate_ok(INPUTS["lab4"], ssh, "--no-timestamp")
+            was = isc_v4_suboptions(isc_class_blocks(
+                open(os.path.join(ssh, "dhcpd.conf")).read())["Unmatched"])
+            now = isc_v4_suboptions(blocks["Unmatched"])
+            assert was == now, (
+                "the catch-all changed when TLS was enabled:\n  ssh: %s\n  tls: %s"
+                % ([(hex(c), v.hex()) for c, v in was],
+                   [(hex(c), v.hex()) for c, v in now]))
+        finally:
+            shutil.rmtree(ssh, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bad_address_in_the_model_fails_cleanly():
+    """A typo or leftover placeholder must name the field, not traceback.
+
+    It used to reach ipaddress inside a TLV builder and surface as a raw
+    AddressValueError, which tells an operator nothing about what to fix.
+    """
+    for field, value in (("ca_server_ipv4", "REPLACE-ME"),
+                         ("ca_server_ipv6", "not:an:address")):
+        tmp = tempfile.mkdtemp(prefix="oran-gen-addr-")
+        try:
+            model = open(INPUTS["lab4tls"]).read()
+            model = re.sub(r'(%s:\s*)"[^"]*"' % field, r'\1"%s"' % value, model)
+            bad = _write_yaml(tmp, model)
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            proc = generate(bad, out, "--no-timestamp")
+            assert proc.returncode != 0, "%s: %r should be rejected" % (field, value)
+            assert b"Traceback" not in proc.stdout, \
+                "%s produced a traceback:\n%s" % (field, proc.stdout.decode())
+            assert field.encode() in proc.stdout, \
+                "the error should name the field:\n%s" % proc.stdout.decode()
+            assert not os.listdir(out), "must not leave partial output"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

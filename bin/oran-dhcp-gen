@@ -55,7 +55,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.8.0"
+__version__ = "2.8.1"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -115,6 +115,20 @@ def die(msg):
 
 def warn(msg):
     print(f"[WARN] {msg}")
+
+
+def check_address(value, family, where):
+    """Parse an address from the model, or die naming where it came from.
+
+    Without this a typo or a leftover placeholder reaches ipaddress inside a
+    TLV builder and comes out as a raw AddressValueError traceback, which
+    tells an operator nothing about which field to fix.
+    """
+    cls_ = ipaddress.IPv4Address if family == "ipv4" else ipaddress.IPv6Address
+    try:
+        return cls_(value)
+    except (ipaddress.AddressValueError, ValueError) as e:
+        die(f"{where}: '{value}' is not a valid {family} address ({e})")
 
 
 def apply_class_defaults(cfg):
@@ -190,6 +204,8 @@ def validate(cfg):
                 f"has never implemented. TLS CA/RA bootstrap is configured with "
                 f"a top-level 'ca_ra_profiles' entry referenced from a class via "
                 f"'ca_ra: {{ profile: <name>, port: N }}' — see the user guide.")
+        check_address(c["ipv4"], "ipv4", f"controller '{c['name']}' ipv4")
+        check_address(c["ipv6"], "ipv6", f"controller '{c['name']}' ipv6")
         for k in c:
             if k not in KNOWN_CTRL_KEYS:
                 warn(f"Controller '{c['name']}': unknown field '{k}' — ignored. "
@@ -216,6 +232,9 @@ def validate(cfg):
             die(f"ca_ra_profile '{name}' must define at least one of "
                 f"ca_server_ipv4, ca_server_ipv6 or ca_server_fqdn — the O-RU "
                 f"needs some way to reach the CA/RA server")
+        for key, fam in (("ca_server_ipv4", "ipv4"), ("ca_server_ipv6", "ipv6")):
+            if key in prof:
+                check_address(prof[key], fam, f"ca_ra_profile '{name}' {key}")
         for f in ("uri_path", "subject_dn", "app_protocol"):
             if f not in prof:
                 die(f"ca_ra_profile '{name}' missing required field: '{f}'")

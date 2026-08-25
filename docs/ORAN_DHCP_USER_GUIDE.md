@@ -2,7 +2,7 @@
 
 **Version:** 4.5.0
 **Last Updated:** 2026-08-25
-**Packages Covered:** `oran-dhcp-gen` v2.8.0 · `dhcp-oru-toolkit` v2.1.2
+**Packages Covered:** `oran-dhcp-gen` v2.8.1 · `dhcp-oru-toolkit` v2.1.2
 
 > The lease viewer was renamed. `dhcp-lease-list` 1.3.0 became the
 > `dhcp-oru-toolkit` package at 2.0.0, which ships `dhcp-lease-list` and
@@ -1070,6 +1070,7 @@ sudo systemctl restart isc-dhcp-server
 
 | Version | Changes |
 |---------|---------|
+| 2.8.1 | Added `References/kea/Lab4/oran_dhcp-tls.yaml` — the Lab4 model with TLS call-home actually enabled, CA/RA settings recovered from the `tls_ca:` block that file used to carry commented out. Its catch-all stays on SSH and byte-identical. Also: a malformed address in the model now fails validation naming the field instead of surfacing as an `ipaddress` traceback from inside a TLV builder |
 | 2.8.0 | **Sub-option `0x02` (CA/RA server FQDN)**, via `ca_ra_profile.ca_server_fqdn` — reaches the CA by name and serves both families from one value. A profile must now offer an address or a FQDN, and an address-only profile must cover every family its classes serve. Includes an audit of the emitter's sub-option coverage against the evidence available (see [Sub-option coverage and its basis](#sub-option-coverage-and-its-basis)) |
 | 2.7.0 | **`--explain`** prints what each class will actually receive — match prefix, pool range, and the option 43 / 17 chain decoded sub-option by sub-option, plus the flat hex — and writes nothing. Flags a `tls` class sending no 0x87 with the port the O-RU will fall back to. Built on the same resolved sub-options the emitters use, and checked against the generated configs by test, so it cannot drift from what is emitted |
 | 2.6.0 | **Top-level `defaults:` block** — every class inherits `controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra` and `options` unless it sets its own, so switching a lab between SSH and TLS is one edit rather than one per class. A class setting always wins; `ca_ra` merges one level deep and is not inherited into an `ssh` class. Also: a `protocol: tls` class with no `callhome_port` now warns — it is the exact case 0x87 exists to prevent, and both TLS classes in the Lab01 reference were silently in it |

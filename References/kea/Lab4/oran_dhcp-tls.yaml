@@ -1,0 +1,112 @@
+# oran_dhcp.yaml — Lab4 with NETCONF call-home over TLS enabled
+#
+# ===========================================================================
+# BEFORE YOU DEPLOY THIS: confirm ONE value — ca_server_ipv4.
+#
+# The CA/RA settings below were recovered from the commented-out `tls_ca:`
+# block that shipped in oran_dhcp.yaml alongside this file. That block
+# recorded only an IPv6 CA address. Every class here serves IPv4 as well, so
+# an IPv4 CA address is required, and the value below is a PLACEHOLDER chosen
+# to sit in this lab's subnet — it was not recovered from anything.
+#
+# Check it before generating:
+#     oran-dhcp-gen oran_dhcp-tls.yaml --explain | grep -A1 'CA/RA server IP'
+#
+# If the CA is IPv6-only, delete ca_server_ipv4 and the ipv4_range from the
+# two ATT classes; the generator will then refuse any IPv4 class that has no
+# way to reach the CA rather than emitting a chain that cannot enrol.
+# ===========================================================================
+#
+# This file is oran_dhcp.yaml with TLS turned on. It is kept separate rather
+# than replacing it because oran_dhcp.yaml records what the lab runs today
+# (SSH), and is a regression-test input.
+#
+# Switching back to SSH is the one `protocol:` line in `defaults:` below.
+
+global:
+  default_lease_time: 43200      # 12 hours
+  max_lease_time:     86400      # 24 hours
+  oran_enterprise_id: 53148      # O-RAN Alliance IANA — do not change
+
+controllers:
+  - name: ctrl_primary
+    description: "Primary O-RU controller"
+    ipv4: "192.168.44.6"
+    ipv6: "fd00:8b36:f2a9::2c:6"
+
+  - name: ctrl_att
+    description: "ATT-specific controller (same node as ctrl_primary today)"
+    ipv4: "192.168.44.6"
+    ipv6: "fd00:8b36:f2a9::2c:6"
+
+# ---------------------------------------------------------------------------
+# CA/RA profile — the PKI endpoint an O-RU enrols against before it can
+# complete a TLS call-home. Values recovered from the `tls_ca:` block that
+# oran_dhcp.yaml carried commented out; see the header for the one exception.
+# ---------------------------------------------------------------------------
+ca_ra_profiles:
+  att_spm:
+    description: "ATT/1Finity SPM CA"
+    ca_server_ipv4: "192.168.44.240"    # <-- PLACEHOLDER, CONFIRM. sub-opt 0x01
+    ca_server_ipv6: "fd00:8b36:f2a9::95:240"   # recovered.      sub-opt 0x01
+    uri_path:       "/pkix/"                                   # sub-opt 0x04
+    subject_dn:     "/OU=SPM/O=1Finity/C=US/CN=ATT-SSL/L=WV/ST=Texas"  # 0x05
+    app_protocol:   "http"                                     # sub-opt 0x06
+
+# ---------------------------------------------------------------------------
+# Lab-wide defaults. Every class inherits these unless it says otherwise, so
+# turning TLS off again is the single `protocol:` line here.
+# ---------------------------------------------------------------------------
+defaults:
+  controller: ctrl_att
+  protocol: tls
+  callhome_port: auto            # -> 4335 (sub-opt 0x87). Without this the
+                                 # O-RU uses its firmware default of 4334,
+                                 # the SSH port, and TLS never completes.
+  ca_ra:
+    profile: att_spm
+    port: 8091                   # CA/RA port (sub-opt 0x03), recovered
+
+oru_classes:
+
+  - name: ATTn77
+    description: "ATT n77 band RU (44R14 series)"
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    ipv4_range: "192.168.44.160-169"
+    ipv6_range: "fd00:8b36:f2a9::160-169"
+
+  - name: ATTn25n66
+    description: "ATT n25/n66 band RU (44R26 series)"
+    match_prefix: "o-ran-ru2/FJ/44R26"
+    ipv4_range: "192.168.44.170-179"
+    ipv6_range: "fd00:8b36:f2a9::170-179"
+
+  # Catch-all — keep last. Stays on SSH: an unrecognised O-RU has no business
+  # being pointed at the CA. Overriding protocol here is all it takes, and the
+  # ca_ra block is not inherited into an ssh class.
+  - name: Unmatched
+    description: "Fallback for unrecognised vendor class"
+    match_prefix: ""
+    controller: ctrl_primary
+    protocol: ssh
+    callhome_port:                 # explicitly none — an unrecognised O-RU
+                                   # gets the bare controller IP and nothing
+                                   # else, exactly as it does today
+    ipv4_range: "192.168.44.180-189"
+    ipv6_range: "fd00:8b36:f2a9::180-199"
+    options:
+      interface_mtu: 1440
+
+subnets:
+  ipv4:
+    - subnet: "192.168.44.0/24"
+      gateway: "192.168.44.1"
+      dns_servers:
+        - "192.168.44.1"
+      interface: "br-mplane"
+
+  ipv6:
+    - subnet: "fd00:8b36:f2a9::/64"
+      dns_servers:
+        - "fd00:8b36:f2a9::1"
+      interface: "br-mplane"
