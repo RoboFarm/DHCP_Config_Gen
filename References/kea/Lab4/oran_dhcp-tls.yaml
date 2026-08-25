@@ -22,20 +22,22 @@
 # itself with "405 CMP requires POST", which only that path and that scheme
 # produce.
 #
-# One caveat on subject_dn, which is weaker evidence than the rest.
-# Sub-option 0x05 is the CA/RA server's OWN Subject Name — it is how the O-RU
-# identifies the CA whose response it should trust. What has been checked is
-# that the DN below is the one Lab04 puts on the wire, and that Lab01 and
-# Lab03 send the same string. Neither fact establishes that it matches the
-# subject of the certificate this lab's CA actually signs with, and this CA is
-# a different implementation from Lab03's (a Python 'orucara' responder, not
-# EJBCA). Confirm it directly:
+# On subject_dn, which had been the open question here: it is now settled by
+# a counter-example, not by inspecting a certificate.
 #
-#     openssl x509 -in <orucara CA cert> -noout -subject
+# The srsllsc1 stack in this same lab advertises this exact 69-byte string —
+# /CN=1FinityLab Root CA/OU=WV Lab/O=1Finity/L=Richardson/ST=Texas/C=US — from
+# a DHCP server this tool did not generate, and a 44R14-N77a enrolled against
+# it over CMPv2 in under ten seconds and reached TLS call-home. So a DN that
+# does not match the CA certificate's own subject is NOT what makes an O-RU
+# loop on enrolment; this string is what a working deployment sends. See
+# References/srsllsc1/ for the capture and the test that pins it.
 #
-# A mismatch here does not stop the CA issuing — it stops the O-RU accepting
-# what was issued, which looks like an endless re-enrolment loop rather than
-# an error.
+# What still differs between there and here is the CA host itself: srsllsc1
+# points 0x01/0x81 at fd00:8b36:f2a9::38:c, this model at ::2c:6. Same port,
+# same path, same protocol, same DN. If an O-RU loops against ::2c:6 while
+# the identical chain works against ::38:c, the fault is in that responder,
+# not in the DHCP payload.
 #
 # To see exactly what an O-RU will be sent, without writing anything:
 #     oran-dhcp-gen oran_dhcp-tls.yaml --explain

@@ -18,6 +18,7 @@ survived three releases.  Those two tests compare the emitted ISC and Kea files
 against each other, so a repeat of that defect fails here instead of in a lab.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -44,6 +45,14 @@ INPUTS = {
 # line breaks.
 HANDWRITTEN = {
     "lab01": os.path.join(REPO_ROOT, "References", "isc", "Lab01"),
+}
+
+# A capture of a DHCP server this tool did not generate, taken off the wire in
+# a deployment where TLS call-home demonstrably worked.  Not in INPUTS: it is
+# single-family, so it has no five-file golden, and it is a wire reproduction
+# rather than a config anyone deploys.
+OBSERVED = {
+    "srsllsc1": os.path.join(REPO_ROOT, "References", "srsllsc1", "oran_dhcp.yaml"),
 }
 OUTPUT_FILES = ("dhcpd.conf", "dhcpd6.conf", "isc-dhcp-server",
                 "kea-dhcp4.conf", "kea-dhcp6.conf")
@@ -1252,6 +1261,205 @@ def test_packaging_templates_carry_no_literal_version():
             "packaging/debian/%s: %s is %r, not @VERSION@ -- build-deb.sh fills "
             "it from __version__, and hand-editing is how the shipped 2.2.3 man "
             "page ended up saying 2.2.2" % (fname, what, m.group(1)))
+
+
+# ---------------------------------------------------------------------------
+# Reproducing a capture from a deployment that works
+# ---------------------------------------------------------------------------
+
+# Transcribed from the O-RU's own scapy decode of the DHCPv6 Reply it accepted
+# on 2026-08-24 16:49:49, ten seconds before it reported "CMPV2 is ready".
+# See References/srsllsc1/observed-dhcpv6-option17.txt.
+_SRS_CA_V6 = "fd00:8b36:f2a9::38:c"
+_SRS_DN = ("/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity"
+           "/L=Richardson/ST=Texas/C=US")
+_SRS_OBSERVED = [
+    (0x01, ipaddress.IPv6Address(_SRS_CA_V6).packed),
+    (0x03, b"\x1f\x90"),                 # 8080
+    (0x04, b"/pkix/"),
+    (0x05, _SRS_DN.encode()),
+    (0x06, b"http"),
+    (0x81, ipaddress.IPv6Address(_SRS_CA_V6).packed),
+    (0x86, b"\x01"),                      # TLS
+]
+
+
+def test_generator_reproduces_srsllsc1_observed_chain():
+    """The emitted option 17 must equal a chain an O-RU really enrolled against.
+
+    Every other check in this suite compares the generator against itself, a
+    hand-written config, or a reading of the spec.  This one compares it
+    against a DHCP server nobody here wrote, serving a radio that completed
+    CMPv2 and reached TLS call-home.  If the encoding of 0x01/0x03/0x04/0x05/
+    0x06/0x81/0x86 were wrong, that enrolment could not have happened.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-srs-")
+    try:
+        generate_ok(OBSERVED["srsllsc1"], tmp, "--no-timestamp")
+        block = isc_class_blocks(
+            open(os.path.join(tmp, "dhcpd6.conf")).read())["N77a"]
+        got = isc_v6_suboptions(block)
+        assert got == _SRS_OBSERVED, (
+            "generated chain differs from the one captured off the wire.\n"
+            "  wire: %s\n  gen:  %s"
+            % ([(hex(c), v.hex(":")) for c, v in _SRS_OBSERVED],
+               [(hex(c), v.hex(":")) for c, v in (got or [])]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_srsllsc1_kea_carries_the_same_values_typed():
+    """Kea must reach the same wire from typed option-data, not a blob.
+
+    The ISC side is compared to the capture byte for byte above; this pins the
+    Kea presentation form that has to encode to those same bytes.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-srs-kea-")
+    try:
+        generate_ok(OBSERVED["srsllsc1"], tmp, "--no-timestamp")
+        cfg = json.load(open(os.path.join(tmp, "kea-dhcp6.conf")))
+        data = kea_vendor_data_by_class(cfg, "Dhcp6")["N77a"]
+        assert data == {
+            0x01: _SRS_CA_V6,
+            0x03: "8080",
+            0x04: "/pkix/",
+            0x05: _SRS_DN,
+            0x06: "http",
+            0x81: _SRS_CA_V6,
+            0x86: "1",
+        }, data
+        types = {d["code"]: d["type"] for d in cfg["Dhcp6"]["option-def"]}
+        assert "binary" not in types.values(), (
+            "a binary option-def is the shape the 2.2.x defect took: %s" % types)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Single-family deployments
+# ---------------------------------------------------------------------------
+
+_V6_ONLY_MODEL = """
+global:
+  default_lease_time: 43200
+  max_lease_time: 86400
+  oran_enterprise_id: 53148
+controllers:
+  - name: c6
+    ipv6: "fd00::1"
+oru_classes:
+  - name: Only
+    match_prefix: ""
+    controller: c6
+    protocol: ssh
+    ipv6_range: "fd00::10-20"
+subnets:
+  ipv6:
+    - subnet: "fd00::/64"
+      interface: "eth0"
+"""
+
+
+def test_single_family_model_skips_the_unserved_family():
+    """An IPv6-only M-plane must not require an invented IPv4 network.
+
+    srsllsc1 runs one, and since a dual-stack O-RU calls home over IPv6 the
+    v4 half would be fiction.  The v4 files are not written at all, and the
+    ISC defaults file says so with an empty INTERFACESv4.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-v6only-")
+    try:
+        path = os.path.join(tmp, "model.yaml")
+        open(path, "w").write(_V6_ONLY_MODEL)
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        generate_ok(path, out, "--no-timestamp")
+        written = set(os.listdir(out))
+        assert written == {"dhcpd6.conf", "isc-dhcp-server", "kea-dhcp6.conf"}, (
+            "expected only the IPv6 files, got %s" % sorted(written))
+        defaults = open(os.path.join(out, "isc-dhcp-server")).read()
+        assert 'INTERFACESv4=""' in defaults, defaults
+        assert 'INTERFACESv6="eth0"' in defaults, defaults
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+_V4_CLASS_NO_CTRL_ADDR = """
+global:
+  default_lease_time: 43200
+  max_lease_time: 86400
+  oran_enterprise_id: 53148
+controllers:
+  - name: c6
+    ipv6: "fd00::1"
+oru_classes:
+  - name: Only
+    match_prefix: ""
+    controller: c6
+    protocol: ssh
+    ipv4_range: "10.0.0.10-20"
+    ipv6_range: "fd00::10-20"
+subnets:
+  ipv4:
+    - subnet: "10.0.0.0/24"
+      interface: "eth0"
+  ipv6:
+    - subnet: "fd00::/64"
+      interface: "eth0"
+"""
+
+_V4_CLASS_NO_SUBNET = """
+global:
+  default_lease_time: 43200
+  max_lease_time: 86400
+  oran_enterprise_id: 53148
+controllers:
+  - name: c6
+    ipv4: "10.0.0.1"
+    ipv6: "fd00::1"
+oru_classes:
+  - name: Only
+    match_prefix: ""
+    controller: c6
+    protocol: ssh
+    ipv4_range: "10.0.0.10-20"
+    ipv6_range: "fd00::10-20"
+subnets:
+  ipv6:
+    - subnet: "fd00::/64"
+      interface: "eth0"
+"""
+
+
+def _generation_fails_with(model, needle):
+    tmp = tempfile.mkdtemp(prefix="oran-gen-fail-")
+    try:
+        path = os.path.join(tmp, "model.yaml")
+        open(path, "w").write(model)
+        proc = generate(path, os.path.join(tmp, "out"), "--no-timestamp")
+        assert proc.returncode != 0, (
+            "generation should have failed:\n%s" % proc.stdout.decode())
+        assert needle.encode() in proc.stdout, proc.stdout.decode()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_class_family_without_a_controller_address_is_fatal():
+    """A class serving a family its controller cannot reach must not generate.
+
+    The chain would go out with no 0x81 for that family: the O-RU takes a
+    lease, looks healthy, and never learns where to call home.
+    """
+    _generation_fails_with(_V4_CLASS_NO_CTRL_ADDR, "defines no ipv4 address")
+
+
+def test_class_family_without_a_subnet_is_fatal():
+    """A range in a family with no subnet would be silently dropped.
+
+    Making subnets per-family optional means a typo'd or leftover ipv4_range
+    would otherwise vanish without a word.
+    """
+    _generation_fails_with(_V4_CLASS_NO_SUBNET, "no ipv4 subnet is defined")
 
 
 # ---------------------------------------------------------------------------

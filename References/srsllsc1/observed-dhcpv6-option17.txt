@@ -1,0 +1,70 @@
+srsllsc1 — DHCPv6 option 17 as observed on the wire, TLS call-home working
+=========================================================================
+
+Provenance
+----------
+Captured 2026-08-24 16:49 by the O-RU itself: a Fujitsu 44R14-N77a
+(vendor class "o-ran-ru2/FJ/44R14-N77a/11A1G00034D", MAC 34:fe:9e:fa:01:04)
+running the dhcp_b.py scan task, which logs scapy's decode of every
+DHCPv6 Advertise/Reply it accepts.  VLAN 201, lease fd00:8b36:f2a9::169,
+preferred 27000 / valid 43200, DNS fd00:8b36:f2a9::1.
+
+The DHCP server here is NOT oran-dhcp-gen output.  It is the srsllsc1
+stack's own server (DUID-LLT, lladdr 76:35:f9:f1:8e:fc), pointing at a
+controller and CA at fd00:8b36:f2a9::38:c.  That is what makes this
+capture worth keeping: it is an independent implementation of the same
+O-RAN vendor option, produced by someone else, against which the
+generator's encoding can be checked.
+
+Why it matters
+--------------
+This enrolment SUCCEEDED.  Ten seconds after the lease the O-RU logged
+
+    TLS mode detected, waiting for CMPV2 to complete...
+    /var/log/dhcp_scan_file.json still exists, waiting (1) ...
+    /var/log/dhcp_scan_file.json still exists, waiting (2) ...
+    /var/log/dhcp_scan_file.json is not exist, CMPV2 is ready
+
+and then sent dhcpCompleteNotify with callhomeConnInfo.flag = protocolTLS.
+The rest of the log is ordinary DHCPv6 renewal at T1 every 13500 s.
+
+Option 17, enterprise 53148, 142-byte sub-option chain (scapy optlen 146,
+which counts the 4-byte enterprise number):
+
+    0x0001  len 16   fd00:8b36:f2a9::38:c        CA/RA server IP
+    0x0003  len  2   1f 90                       CA/RA port 8080
+    0x0004  len  6   "/pkix/"                    CA/RA URI path
+    0x0005  len 69   "/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity/L=Richardson/ST=Texas/C=US"
+    0x0006  len  4   "http"                      CA/RA application protocol
+    0x0081  len 16   fd00:8b36:f2a9::38:c        NETCONF controller IP
+    0x0086  len  1   01                          call-home mode = TLS
+
+No 0x02 and no 0x87.  The O-RU's own dhcp_scan_file.json has no field for
+a call-home port at all, so on this firmware build 0x87 has nowhere to
+land even if it is parsed:
+
+    {"ca_ra_ip_address": "[fd00:8b36:f2a9::38:c]", "ca_ra_path": "/pkix/",
+     "ca_ra_port_number": 8080,
+     "ca_ra_subject_name": "/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity/...",
+     "last_ca_ra_fqdn": "", "last_ca_ra_ip_address": "[fd00:8b36:f2a9::38:c]",
+     "last_vlan_scan": 201, "netconf_client_ip_address": "fd00:8b36:f2a9::38:c",
+     "protocol_flag": 1}
+
+What this confirms, and what it does not
+----------------------------------------
+Confirms, against a working deployment this tool did not generate:
+
+  * the DHCPv6 framing — 2-byte code, 2-byte length, no outer wrapper
+  * 0x01 as a bare 16-byte address, not a string
+  * 0x03 as uint16 big-endian
+  * 0x04 as the URI path with both slashes
+  * 0x05 as the subject DN in OpenSSL slash form, one string, no DER
+  * 0x06 as the ASCII protocol name "http", not an enum
+  * 0x81 and 0x86 alongside the CA/RA run, at the same level
+
+Does not confirm 0x02 — this chain does not carry it either.  0x02 remains
+the one sub-option in the generator with no observed example.
+
+oran_dhcp.yaml in this directory reproduces the chain above;
+test_generator_reproduces_srsllsc1_observed_chain compares them byte for
+byte.

@@ -1,6 +1,6 @@
 # O-RAN DHCP Tools — User Guide
 
-**Version:** 4.5.0
+**Version:** 4.6.0
 **Last Updated:** 2026-08-25
 **Packages Covered:** `oran-dhcp-gen` v2.8.6 · `dhcp-oru-toolkit` v2.1.2
 
@@ -253,7 +253,9 @@ controllers:
     ipv6: "fd00:dead:beef::1"
 ```
 
-`name`, `ipv4` and `ipv6` are all required — **both address families, even if a class only uses one.**
+`name` is required, plus **at least one** of `ipv4` / `ipv6`. A controller must carry an address for every family the classes referencing it actually serve; a class with an `ipv4_range` pointing at a controller that defines no `ipv4` is a hard error, because that family's chain would go out with no `0x81` at all and the O-RU would take a lease and never learn where to call home.
+
+Define both unless you genuinely run a single-family M-plane. *(Before 2.9.0 both were mandatory.)*
 
 > **Keep the two families consistent.** If two controller entries describe the same physical node, give them the same IPv4 *and* the same IPv6. A v6 address that silently disagrees with its v4 partner produces no diff at all in the IPv4 output, so the mistake surfaces only as O-RUs that lease an address and then never call home.
 
@@ -451,7 +453,20 @@ subnets:
       interface: "ens20.201"
 ```
 
-Both `subnets.ipv4` and `subnets.ipv6` are required, even if every class disables one family. `interface` is required on each entry — it populates `INTERFACESv4` / `INTERFACESv6` in the ISC defaults file and `interfaces-config` in the Kea configs. `gateway` and `dns_servers` are optional and are simply omitted from the output when absent.
+**At least one** of `subnets.ipv4` / `subnets.ipv6` is required. Defining only one is a supported single-family deployment: the files for the other family are not written at all, and its `INTERFACESv4` / `INTERFACESv6` line in the ISC defaults file is emitted empty, which is how the init script is told not to start that daemon.
+
+```
+$ oran-dhcp-gen v6-only.yaml --target all --outdir /tmp/out
+[SKIP] dhcpd.conf: no subnets.ipv4 defined
+[OK] Generated: /tmp/out/dhcpd6.conf
+[OK] Generated: /tmp/out/isc-dhcp-server
+[SKIP] kea-dhcp4.conf: no subnets.ipv4 defined
+[OK] Generated: /tmp/out/kea-dhcp6.conf
+```
+
+A class carrying a range in a family that has no subnet is a hard error rather than a silent drop — that range would otherwise never be served and nothing would say so. *(Before 2.9.0 both families were mandatory, which meant an IPv6-only M-plane had to invent an IPv4 network; since a dual-stack O-RU calls home over IPv6, the invented half was the one nobody would ever look at.)*
+
+`interface` is required on each entry — it populates `INTERFACESv4` / `INTERFACESv6` in the ISC defaults file and `interfaces-config` in the Kea configs. `gateway` and `dns_servers` are optional and are simply omitted from the output when absent.
 
 ---
 
@@ -534,20 +549,22 @@ Every sub-option the generator emits, and what that mapping actually rests on. T
 
 | Code | Meaning | Basis |
 |---|---|---|
-| `0x01` | CA/RA server IP | **Verified by working config.** Both labs emit it. Lab03 is decisive: its CA (`192.168.36.235`) and controller (`192.168.36.220`) are different hosts, in `0x01` and `0x81` respectively |
-| `0x02` | CA/RA server FQDN | **Inferred, not read from the spec.** It is the only gap in the `0x01`–`0x06` CA/RA run, and it mirrors `0x82` being the FQDN alternative to `0x81`. See the caveat below |
-| `0x03` | CA/RA port | **Verified.** Both labs; Lab01 varies it per family (v4 8081 / v6 8080) |
-| `0x04` | CA/RA URI path | **Verified.** `/pkix/` (Lab01), `/ejbca/publicweb/cmp/ATT_RU` (Lab03) |
-| `0x05` | CA/RA subject DN | **Verified.** Both labs |
-| `0x06` | CA/RA application protocol | **Verified.** Both labs (`http`) |
-| `0x81` | NETCONF controller IP | **Verified.** Both labs, and corroborated by the internal Kea/O-RAN reference notes |
-| `0x82` | Controller FQDN | **Verified.** Lab03 carries `00:82 … "mplane.local"` as the alternative to `0x81`, commented "Controller" |
-| `0x86` | Call-home mode | **Verified.** Both labs (`0x01` = TLS); corroborated as `0x00` = SSH / `0x01` = TLS |
-| `0x87` | Call-home port | **Verified.** Lab03 carries `87:02:10:ee` (4334); corroborated as "port, default 4334 = 0x10EE" |
+| `0x01` | CA/RA server IP | **Confirmed on the wire.** Both labs emit it, and srsllsc1 carries it as a bare 16-byte address. Lab03 is decisive about the split: its CA (`192.168.36.235`) and controller (`192.168.36.220`) are different hosts, in `0x01` and `0x81` respectively |
+| `0x02` | CA/RA server FQDN | **Inferred, not read from the spec.** It is the only gap in the `0x01`–`0x06` CA/RA run, and it mirrors `0x82` being the FQDN alternative to `0x81`. srsllsc1 does not carry it either. See the caveat below |
+| `0x03` | CA/RA port | **Confirmed on the wire.** Both labs, and srsllsc1 as uint16 big-endian (`1f 90` = 8080); Lab01 varies it per family (v4 8081 / v6 8080) |
+| `0x04` | CA/RA URI path | **Confirmed on the wire.** `/pkix/` (Lab01, srsllsc1), `/ejbca/publicweb/cmp/ATT_RU` (Lab03) — the path with both slashes, not a bare segment |
+| `0x05` | CA/RA subject DN | **Confirmed on the wire.** Both labs and srsllsc1, in OpenSSL slash form as one string — not DER, not comma-separated |
+| `0x06` | CA/RA application protocol | **Confirmed on the wire.** Both labs and srsllsc1 (`http`) — the ASCII protocol name, not an enum |
+| `0x81` | NETCONF controller IP | **Confirmed on the wire.** Both labs and srsllsc1, and corroborated by the internal Kea/O-RAN reference notes |
+| `0x82` | Controller FQDN | **Verified against a working config.** Lab03 carries `00:82 … "mplane.local"` as the alternative to `0x81`, commented "Controller" |
+| `0x86` | Call-home mode | **Confirmed on the wire.** Both labs and srsllsc1 (`0x01` = TLS); corroborated as `0x00` = SSH / `0x01` = TLS |
+| `0x87` | Call-home port | **Verified against a working config.** Lab03 carries `87:02:10:ee` (4334); corroborated as "port, default 4334 = 0x10EE". srsllsc1 omits it, and its O-RU's own state file has no field for it |
+
+**"Confirmed on the wire"** means the generator's output was compared byte for byte against `References/srsllsc1/` — a DHCPv6 option 17 chain captured by an O-RU that then completed CMPv2 in ten seconds and reached TLS call-home, served by a DHCP implementation this tool had nothing to do with. That is the only evidence here that is independent of both this generator and the people who wrote the lab configs it was modelled on. `test_generator_reproduces_srsllsc1_observed_chain` holds the two equal.
 
 > **What this audit is not.** It is an audit against evidence — two labs' working configs and internal reference notes — not against the text of O-RAN.WG4.MP.0 clause 6.2.5, which could not be retrieved. Two consequences worth knowing:
 >
-> 1. **`0x02` is the one unverified mapping.** The structural argument is strong, but one public summary of an early specification revision describes the low codes as *O-RU Controller* IP and FQDN rather than CA/RA — which would contradict how both labs use `0x01`. That reading is inconsistent with Lab03's working split of CA and controller across `0x01` and `0x81`, so it most likely describes an earlier revision in which option 43 carried only controller information. Confirm `0x02` against your own copy of the spec before relying on it in production.
+> 1. **`0x02` is the one mapping with no observed example.** No lab config and no capture carries it. The structural argument is strong, but one public summary of an early specification revision describes the low codes as *O-RU Controller* IP and FQDN rather than CA/RA — which would contradict how both labs use `0x01`. That reading is inconsistent with Lab03's working split of CA and controller across `0x01` and `0x81`, so it most likely describes an earlier revision in which option 43 carried only controller information. Confirm `0x02` against your own copy of the spec before relying on it in production.
 > 2. **Coverage beyond these ten codes is unknown.** The spec may define sub-options neither lab uses. Nothing here claims the list is complete.
 
 Chains of three or more sub-options are emitted across multiple lines in the ISC configs, one sub-option per line. This is a readability change only — ISC `dhcpd` parses both forms identically and the wire bytes are the same:
@@ -1084,6 +1101,7 @@ sudo systemctl restart isc-dhcp-server
 | 2.8.3 | Corrected the Lab4 TLS model against Lab04's actual wire bytes — CA/RA port `8091 → 8080` and the subject DN to the 1FinityLab root CA. Both had been recovered from the stale `tls_ca:` block, and 2.8.2 had wrongly recorded the port as confirmed. The model's option 43 is now byte-identical to what Lab04 serves |
 | 2.8.2 | Set the Lab4 TLS model's real CA/RA addresses (`192.168.44.6` / `fd00:8b36:f2a9::2c:6`) in place of 2.8.1's placeholder. The CA runs on the controller host, so `0x01` and `0x81` carry the same address |
 | 2.8.1 | Added `References/kea/Lab4/oran_dhcp-tls.yaml` — the Lab4 model with TLS call-home actually enabled, CA/RA settings recovered from the `tls_ca:` block that file used to carry commented out. Its catch-all stays on SSH and byte-identical. Also: a malformed address in the model now fails validation naming the field instead of surfacing as an `ipaddress` traceback from inside a TLV builder |
+| 2.9.0 | **The TLS sub-option encoding is now confirmed against a deployment this tool did not configure.** `References/srsllsc1/` records the DHCPv6 option 17 chain a second stack in the same lab puts on the wire, captured by the O-RU itself in a run where CMPv2 completed and TLS call-home came up; the generator reproduces it byte for byte and a test holds it there (see [Sub-option coverage and its basis](#sub-option-coverage-and-its-basis)). That capture also carries the same `subject_dn` a Lab04 O-RU was looping on, which rules the DN out as the cause of a re-enrolment loop. **Single-family deployments** are supported: `subnets` and each controller now need only the families actually served, and the unserved family's files are not written. Two new hard errors close the gaps that opens — a class serving a family its controller has no address for, and a range in a family with no subnet |
 | 2.8.0 | **Sub-option `0x02` (CA/RA server FQDN)**, via `ca_ra_profile.ca_server_fqdn` — reaches the CA by name and serves both families from one value. A profile must now offer an address or a FQDN, and an address-only profile must cover every family its classes serve. Includes an audit of the emitter's sub-option coverage against the evidence available (see [Sub-option coverage and its basis](#sub-option-coverage-and-its-basis)) |
 | 2.7.0 | **`--explain`** prints what each class will actually receive — match prefix, pool range, and the option 43 / 17 chain decoded sub-option by sub-option, plus the flat hex — and writes nothing. Flags a `tls` class sending no 0x87 with the port the O-RU will fall back to. Built on the same resolved sub-options the emitters use, and checked against the generated configs by test, so it cannot drift from what is emitted |
 | 2.6.0 | **Top-level `defaults:` block** — every class inherits `controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra` and `options` unless it sets its own, so switching a lab between SSH and TLS is one edit rather than one per class. A class setting always wins; `ca_ra` merges one level deep and is not inherited into an `ssh` class. Also: a `protocol: tls` class with no `callhome_port` now warns — it is the exact case 0x87 exists to prevent, and both TLS classes in the Lab01 reference were silently in it |

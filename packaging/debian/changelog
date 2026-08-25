@@ -1,3 +1,43 @@
+oran-dhcp-gen (2.9.0) stable; urgency=medium
+
+  * The TLS sub-option encoding is now confirmed against a deployment this
+    tool did not configure. References/srsllsc1/ records the DHCPv6 option 17
+    chain that a second stack in the same lab puts on the wire, captured by
+    the O-RU itself, in a run where CMPv2 completed in ten seconds and TLS
+    call-home came up. oran-dhcp-gen reproduces that 142-byte chain byte for
+    byte, and test_generator_reproduces_srsllsc1_observed_chain holds it
+    there. Everything else in this suite compares the generator against
+    itself, a hand-written config, or a reading of the spec; this is the
+    first check against a working third-party implementation, and it settles
+    0x01, 0x03, 0x04, 0x05, 0x06, 0x81 and 0x86 on the DHCPv6 side.
+  * That capture also retires the leading theory about Lab04's enrolment
+    loop. srsllsc1 advertises the identical subject_dn -- the same 69 bytes
+    2.8.6 flagged as unconfirmed -- and its O-RU enrolled without complaint.
+    A subject_dn that does not match the CA certificate's own subject is
+    therefore not what makes an O-RU re-enrol forever. What differs between
+    the two is the CA host: ::38:c works, ::2c:6 loops, with the same port,
+    path, protocol and DN. That points at the responder, not the DHCP
+    payload, and the Lab4 TLS model's header now says so.
+  * Single-family deployments are supported. subnets now needs only one of
+    ipv4/ipv6 rather than both, a controller needs an address only for the
+    families its classes serve, and the files for an unserved family are not
+    written at all (with an empty INTERFACESv4/v6 in isc-dhcp-server so the
+    init script does not start that daemon). srsllsc1 runs an IPv6-only
+    M-plane; requiring an IPv4 subnet there meant inventing a network, and
+    since a dual-stack O-RU calls home over IPv6 the invented half was the
+    one nobody would ever look at.
+  * Two new fatal checks close the gaps that opening this up would otherwise
+    leave. A class serving a family its controller has no address for used to
+    be impossible to express and would now emit a chain with no 0x81 for that
+    family -- a lease that looks healthy and never leads anywhere. A class
+    with a range in a family that has no subnet would be silently dropped.
+    Both now die() with the fix named.
+  * No change to any existing output: all four reference inputs define both
+    families, and the only golden-file diff in this release is the version
+    banner -- one line per file, twenty files, nothing else.
+
+ -- labuser <labuser@dhcp-server>  Tue, 26 Aug 2026 00:30:00 +0000
+
 oran-dhcp-gen (2.8.6) stable; urgency=medium
 
   * Walked back an overstated claim. 2.8.5 said every CA/RA value in the Lab4

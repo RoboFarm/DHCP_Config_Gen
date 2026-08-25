@@ -1,0 +1,62 @@
+# oran_dhcp.yaml — reproduces the srsllsc1 stack's DHCPv6 vendor chain
+#
+# ===========================================================================
+# This is not a lab config to deploy.  It is the smallest model that makes
+# oran-dhcp-gen emit, byte for byte, the option 17 chain that srsllsc1's own
+# DHCP server put on the wire on 2026-08-24 and that a Fujitsu 44R14-N77a
+# enrolled against successfully over CMPv2.
+#
+# See observed-dhcpv6-option17.txt in this directory for the capture, its
+# provenance, and what it does and does not establish.
+#
+# The class is IPv6-only because that is all the capture shows: the O-RU's
+# dhcpCompleteNotify carried an empty dhcpInfoV4.  Adding a v4 range here
+# would invent bytes nobody observed.
+#
+# No callhome_port, so no 0x87 — matching the capture.  That makes this model
+# warn ("tls without callhome_port"), which is correct and deliberate: the
+# working deployment really does leave the O-RU on its firmware default.
+# ===========================================================================
+
+global:
+  default_lease_time: 43200      # ISC derives preferred-lifetime 27000 from
+  max_lease_time:     86400      # this (5/8), matching the capture
+  oran_enterprise_id: 53148
+
+controllers:
+  - name: srs_ctrl
+    description: "srsllsc1 controller — also hosts the CMPv2 responder"
+    ipv6: "fd00:8b36:f2a9::38:c"
+
+ca_ra_profiles:
+  srs_ca:
+    description: "srsllsc1 CMPv2 responder, co-located with the controller"
+    ca_server_ipv6: "fd00:8b36:f2a9::38:c"                     # sub-opt 0x01
+    uri_path:       "/pkix/"                                   # sub-opt 0x04
+    subject_dn:     "/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity/L=Richardson/ST=Texas/C=US"  # 0x05
+    app_protocol:   "http"                                     # sub-opt 0x06
+
+oru_classes:
+  - name: N77a
+    description: "Fujitsu 44R14-N77a, the radio in the capture"
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    protocol: tls
+    controller: srs_ctrl
+    ipv6_range: "fd00:8b36:f2a9::160-169"
+    ca_ra:
+      profile: srs_ca
+      port: 8080                                               # sub-opt 0x03
+
+  - name: Unmatched
+    description: "Fallback — not part of the capture, kept so the model is valid"
+    match_prefix: ""
+    controller: srs_ctrl
+    protocol: ssh
+    ipv6_range: "fd00:8b36:f2a9::180-199"
+
+subnets:
+  ipv6:
+    - subnet: "fd00:8b36:f2a9::/64"
+      dns_servers:
+        - "fd00:8b36:f2a9::1"
+      interface: "br-mplane"

@@ -55,7 +55,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.8.6"
+__version__ = "2.9.0"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -78,7 +78,7 @@ def generated_by():
 # ---------------------------------------------------------------------------
 
 REQUIRED_GLOBAL = ["default_lease_time", "max_lease_time", "oran_enterprise_id"]
-REQUIRED_CTRL   = ["name", "ipv4", "ipv6"]
+REQUIRED_CTRL   = ["name"]        # ipv4/ipv6 are per-family, see validate()
 REQUIRED_CLASS  = ["name", "match_prefix", "controller", "protocol"]
 VALID_PROTOCOLS = ["ssh", "tls"]
 
@@ -204,8 +204,18 @@ def validate(cfg):
                 f"has never implemented. TLS CA/RA bootstrap is configured with "
                 f"a top-level 'ca_ra_profiles' entry referenced from a class via "
                 f"'ca_ra: {{ profile: <name>, port: N }}' — see the user guide.")
-        check_address(c["ipv4"], "ipv4", f"controller '{c['name']}' ipv4")
-        check_address(c["ipv6"], "ipv6", f"controller '{c['name']}' ipv6")
+        # A controller may be single-family.  srsllsc1 runs an IPv6-only
+        # M-plane -- and since a dual-stack O-RU calls home over IPv6 anyway,
+        # requiring an IPv4 address there would mean inventing one.  Which
+        # families a controller must cover is decided per class below, from
+        # the ranges that class actually serves.
+        if "ipv4" not in c and "ipv6" not in c:
+            die(f"Controller '{c['name']}' defines neither ipv4 nor ipv6 — "
+                f"it needs at least one address for an O-RU to call home to")
+        if "ipv4" in c:
+            check_address(c["ipv4"], "ipv4", f"controller '{c['name']}' ipv4")
+        if "ipv6" in c:
+            check_address(c["ipv6"], "ipv6", f"controller '{c['name']}' ipv6")
         for k in c:
             if k not in KNOWN_CTRL_KEYS:
                 warn(f"Controller '{c['name']}': unknown field '{k}' — ignored. "
@@ -252,10 +262,12 @@ def validate(cfg):
     # --- subnets ---
     if "subnets" not in cfg:
         die("subnets section is required")
-    if not cfg["subnets"].get("ipv4"):
-        die("subnets.ipv4 is required")
-    if not cfg["subnets"].get("ipv6"):
-        die("subnets.ipv6 is required")
+    # One family is enough.  An IPv6-only M-plane is a real deployment --
+    # srsllsc1 runs one -- and since a dual-stack O-RU calls home over IPv6,
+    # demanding an IPv4 subnet there would mean inventing a network.  The
+    # files for an unserved family are not written at all.
+    if not cfg["subnets"].get("ipv4") and not cfg["subnets"].get("ipv6"):
+        die("subnets must define at least one of 'ipv4' or 'ipv6'")
 
     # --- oru_classes ---
     classes = cfg.get("oru_classes", [])
@@ -327,6 +339,23 @@ def validate(cfg):
             parse_ipv4_range(cls["ipv4_range"], name)
         if "ipv6_range" in cls:
             parse_ipv6_range(cls["ipv6_range"], name)
+
+        # The controller has to carry an address for every family the class
+        # serves; otherwise that family's chain would have no 0x81 at all and
+        # the O-RU would take a lease and never learn where to call home.
+        ctrl = controllers[cls["controller"]]
+        for fam, range_key in (("ipv4", "ipv4_range"), ("ipv6", "ipv6_range")):
+            if range_key in cls and fam not in ctrl:
+                die(f"oru_class '{name}' serves {fam} (has {range_key}) but "
+                    f"controller '{cls['controller']}' defines no {fam} "
+                    f"address — the {fam} chain would carry no controller IP")
+            # Without the subnet that family's file is never written, so the
+            # range would be silently dropped rather than served.
+            if range_key in cls and not cfg["subnets"].get(fam):
+                die(f"oru_class '{name}' has {range_key} but no {fam} subnet "
+                    f"is defined, so no {fam} config is generated and the "
+                    f"range would never be served. Add subnets.{fam}, or drop "
+                    f"{range_key} from the class.")
 
         # New: lease_profile reference
         lp = cls.get("lease_profile")
@@ -1114,13 +1143,15 @@ def gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles):
 
 
 def gen_isc_defaults(cfg):
+    # A family with no subnet gets an empty INTERFACES line, which is how the
+    # init script is told not to start that daemon.
     v4_ifaces = list(dict.fromkeys(
-        s["interface"] for s in cfg["subnets"]["ipv4"] if "interface" in s))
+        s["interface"] for s in cfg["subnets"].get("ipv4") or [] if "interface" in s))
     v6_ifaces = list(dict.fromkeys(
-        s["interface"] for s in cfg["subnets"]["ipv6"] if "interface" in s))
-    if not v4_ifaces:
+        s["interface"] for s in cfg["subnets"].get("ipv6") or [] if "interface" in s))
+    if cfg["subnets"].get("ipv4") and not v4_ifaces:
         die("subnets.ipv4 entries must include an 'interface' field")
-    if not v6_ifaces:
+    if cfg["subnets"].get("ipv6") and not v6_ifaces:
         die("subnets.ipv6 entries must include an 'interface' field")
 
     lines = [
@@ -1620,26 +1651,30 @@ def main():
 
     generated = []
 
-    if args.target in ("isc", "all"):
-        for fname, gen_func in (
-            ("dhcpd.conf",      lambda: gen_isc_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
-            ("dhcpd6.conf",     lambda: gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
-            ("isc-dhcp-server", lambda: gen_isc_defaults(cfg)),
-        ):
+    # A file for a family the deployment does not serve is not written.  With
+    # both families defined -- every reference input -- this changes nothing.
+    def _emit(entries):
+        for fname, family, gen_func in entries:
+            if family and not cfg["subnets"].get(family):
+                print(f"[SKIP] {fname}: no subnets.{family} defined")
+                continue
             out = outdir / fname
             out.write_text(gen_func())
             print(f"[OK] Generated: {out}")
             generated.append((fname, out))
 
+    if args.target in ("isc", "all"):
+        _emit((
+            ("dhcpd.conf",      "ipv4", lambda: gen_isc_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("dhcpd6.conf",     "ipv6", lambda: gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("isc-dhcp-server", None,   lambda: gen_isc_defaults(cfg)),
+        ))
+
     if args.target in ("kea", "all"):
-        for fname, gen_func in (
-            ("kea-dhcp4.conf",  lambda: gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
-            ("kea-dhcp6.conf",  lambda: gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
-        ):
-            out = outdir / fname
-            out.write_text(gen_func())
-            print(f"[OK] Generated: {out}")
-            generated.append((fname, out))
+        _emit((
+            ("kea-dhcp4.conf",  "ipv4", lambda: gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("kea-dhcp6.conf",  "ipv6", lambda: gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
+        ))
 
     print(f"\n[DONE] Output written to: {outdir}/")
 

@@ -9,7 +9,7 @@ matches that prefix to a class and returns the NETCONF controller address in the
 vendor options — DHCPv4 **option 43** and DHCPv6 **option 17** (enterprise ID **53148**) —
 so the O-RU knows where to call home (SSH 4334 / TLS 4335).
 
-Current version: **2.8.6** · Python 3, no dependencies beyond `python3-yaml`.
+Current version: **2.9.0** · Python 3, no dependencies beyond `python3-yaml`.
 
 ## Repository layout
 
@@ -23,6 +23,7 @@ Current version: **2.8.6** · Python 3, no dependencies beyond `python3-yaml`.
 | `docs/ORAN_DHCP_USER_GUIDE.md` | User guide |
 | `References/isc/Lab03/` | Hand-written ISC configs from a real lab, predating the generator |
 | `References/kea/Lab4/` | A working `oran_dhcp.yaml` plus the Kea configs generated from it |
+| `References/srsllsc1/` | A DHCPv6 option 17 chain captured off the wire where TLS call-home works, plus the model that reproduces it byte for byte |
 | `CLAUDE.md` | Architecture notes, invariants, and the domain rules that constrain edits |
 
 Build output goes to `build/` and `dist/`, both gitignored.
