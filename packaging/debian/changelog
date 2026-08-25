@@ -1,3 +1,22 @@
+oran-dhcp-gen (2.8.5) stable; urgency=medium
+
+  * The Lab4 TLS model's CA/RA profile is now confirmed end to end. The last
+    two values still inherited from the stale `tls_ca:` sketch -- uri_path
+    /pkix/ and app_protocol http -- were checked against the running CA: a
+    plain-HTTP GET to http://[fd00:8b36:f2a9::2c:6]:8080/pkix/ is answered by
+    the CMP responder with "405 CMP requires POST", which only that path and
+    that scheme produce. A wrong path would 404.
+    Nothing in that profile is guesswork any more, and the file header says so.
+  * The dual-stack IPv6 rule recorded in 2.8.4 is confirmed by the O-RU
+    itself, not just asserted. A 44R14 on Lab04 received both chains and wrote
+    the v6 values to its dhcp_scan_file.json:
+      ca_ra_ip_address "[fd00:8b36:f2a9::2c:6]", port 8080, protocol_flag 1
+    Its own decode of the option 17 chain matches the generated model
+    sub-option for sub-option, and the vendor option length it reported
+    (152 = 4 enterprise + 148) is exactly what --explain predicts.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 21:50:00 +0000
+
 oran-dhcp-gen (2.8.4) stable; urgency=medium
 
   * Recorded a domain rule that changes how a deployment should be verified:

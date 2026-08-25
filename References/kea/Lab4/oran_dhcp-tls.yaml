@@ -17,8 +17,14 @@
 #                                   ->  /CN=1FinityLab Root CA/...
 #
 # uri_path (/pkix/) and app_protocol (http) came from the same block and
-# happened to be right. The subject DN is now the same one Lab01 and Lab03
-# send, so all three labs share the root CA.
+# turned out to be right: a plain-HTTP GET to
+# http://[fd00:8b36:f2a9::2c:6]:8080/pkix/ is answered by the CMP responder
+# itself with "405 CMP requires POST", which only that path and that scheme
+# produce. The subject DN is the same one Lab01 and Lab03 send, so all three
+# labs share the root CA.
+#
+# Every CA/RA value in this profile is therefore confirmed against the running
+# lab — no value here is still inherited from the old tls_ca sketch.
 #
 # To see exactly what an O-RU will be sent, without writing anything:
 #     oran-dhcp-gen oran_dhcp-tls.yaml --explain
