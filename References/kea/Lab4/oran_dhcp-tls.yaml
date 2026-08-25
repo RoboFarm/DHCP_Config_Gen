@@ -20,11 +20,22 @@
 # turned out to be right: a plain-HTTP GET to
 # http://[fd00:8b36:f2a9::2c:6]:8080/pkix/ is answered by the CMP responder
 # itself with "405 CMP requires POST", which only that path and that scheme
-# produce. The subject DN is the same one Lab01 and Lab03 send, so all three
-# labs share the root CA.
+# produce.
 #
-# Every CA/RA value in this profile is therefore confirmed against the running
-# lab — no value here is still inherited from the old tls_ca sketch.
+# One caveat on subject_dn, which is weaker evidence than the rest.
+# Sub-option 0x05 is the CA/RA server's OWN Subject Name — it is how the O-RU
+# identifies the CA whose response it should trust. What has been checked is
+# that the DN below is the one Lab04 puts on the wire, and that Lab01 and
+# Lab03 send the same string. Neither fact establishes that it matches the
+# subject of the certificate this lab's CA actually signs with, and this CA is
+# a different implementation from Lab03's (a Python 'orucara' responder, not
+# EJBCA). Confirm it directly:
+#
+#     openssl x509 -in <orucara CA cert> -noout -subject
+#
+# A mismatch here does not stop the CA issuing — it stops the O-RU accepting
+# what was issued, which looks like an endless re-enrolment loop rather than
+# an error.
 #
 # To see exactly what an O-RU will be sent, without writing anything:
 #     oran-dhcp-gen oran_dhcp-tls.yaml --explain

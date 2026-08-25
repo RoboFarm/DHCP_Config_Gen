@@ -9,7 +9,7 @@ matches that prefix to a class and returns the NETCONF controller address in the
 vendor options — DHCPv4 **option 43** and DHCPv6 **option 17** (enterprise ID **53148**) —
 so the O-RU knows where to call home (SSH 4334 / TLS 4335).
 
-Current version: **2.8.5** · Python 3, no dependencies beyond `python3-yaml`.
+Current version: **2.8.6** · Python 3, no dependencies beyond `python3-yaml`.
 
 ## Repository layout
 

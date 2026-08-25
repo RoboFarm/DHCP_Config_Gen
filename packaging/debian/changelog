@@ -1,3 +1,26 @@
+oran-dhcp-gen (2.8.6) stable; urgency=medium
+
+  * Walked back an overstated claim. 2.8.5 said every CA/RA value in the Lab4
+    TLS model was confirmed against the running lab. That was true of the
+    addresses, the port, the URI path and the protocol. It was not true of
+    subject_dn in the sense the wording implied.
+    Sub-option 0x05 is the CA/RA server's own Subject Name -- how the O-RU
+    identifies the CA whose response it should trust. What was actually
+    checked is that the DN matches what Lab04 puts on the wire, and that
+    Lab01 and Lab03 send the same string. Neither establishes that it matches
+    the subject of the certificate this lab's CA signs with, and Lab04 runs a
+    different CA implementation from Lab03 -- a Python 'orucara' responder
+    rather than EJBCA.
+    "Matches what is deployed" is not "verified correct", and the file header
+    now says which one this is, with the openssl command to settle it.
+  * Context for why this matters: on Lab04 the CA is issuing certificates
+    successfully every seven seconds, to a new serial each time, in an endless
+    loop. The O-RU is enrolling and then not accepting what comes back, which
+    is the shape a 0x05 mismatch takes -- the CA never errors, so nothing in
+    its log looks wrong.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 22:05:00 +0000
+
 oran-dhcp-gen (2.8.5) stable; urgency=medium
 
   * The Lab4 TLS model's CA/RA profile is now confirmed end to end. The last
