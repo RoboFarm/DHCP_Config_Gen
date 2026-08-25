@@ -37,39 +37,45 @@ ca_ra_profiles:
     subject_dn:     "/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity/L=Richardson/ST=Texas/C=US"
     app_protocol:   "http"                          # sub-opt 0x06
 
+# Everything every class shares. Switching this lab between SSH and TLS is the
+# single `protocol:` line below — a class only spells out what it does
+# differently. Add `callhome_port: auto` here to send sub-option 0x87 (4335)
+# lab-wide; it is left out so this file reproduces the captured configs byte
+# for byte.
+defaults:
+  controller: ctrl
+  protocol: tls
+  ca_ra:
+    profile: onefinity_ca
+
 oru_classes:
 
   - name: TDDn77
     description: "TDD n77 RU (Fujitsu 44R14 series) — TLS with CMP enrolment"
     match_prefix: "o-ran-ru2/FJ/44R14"
-    controller: ctrl
-    protocol: tls
     ipv4_range: "192.168.56.100-119"
     ipv6_range: "fd00:8b36:f2a9::160-169"
     ca_ra:
-      profile: onefinity_ca
       port:                                 # sub-opt 0x03, per family
-        ipv4: 8081
+        ipv4: 8081                          # profile is inherited
         ipv6: 8080
 
   - name: FDDn25n66
     description: "FDD n25/n66 RU (Fujitsu 44R26 series) — TLS with CMP enrolment"
     match_prefix: "o-ran-ru2/FJ/44R26"
-    controller: ctrl
-    protocol: tls
     ipv4_range: "192.168.56.130-159"
     ipv6_range: "fd00:8b36:f2a9::170-179"
     ca_ra:
-      profile: onefinity_ca
       port:
         ipv4: 8083
         ipv6: 8082
 
-  # Catch-all — keep last. SSH, controller IP only (sub-opt 0x81).
+  # Catch-all — keep last. SSH, controller IP only (sub-opt 0x81). Overriding
+  # protocol here is all it takes to opt one class out of the TLS default; the
+  # CA/RA block is not inherited into an SSH class.
   - name: Unmatched
     description: "Fallback for unrecognised vendor-class strings"
     match_prefix: ""
-    controller: ctrl
     protocol: ssh
     ipv4_range: "192.168.56.180-189"
     ipv6_range: "fd00:8b36:f2a9::180-199"

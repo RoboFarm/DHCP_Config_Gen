@@ -42,6 +42,7 @@ Changelog:
 
 import sys
 import re
+import copy
 import json
 import ipaddress
 import argparse
@@ -54,7 +55,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -97,6 +98,15 @@ KNOWN_CLASS_KEYS = {"name", "description", "match_prefix", "controller",
                     "ipv4_range", "ipv6_range", "ca_ra", "options"}
 KNOWN_CA_RA_KEYS = {"profile", "port", "mplane_fqdn", "include_controller_ip"}
 
+# Keys a top-level `defaults:` block may set for every class.  Deliberately
+# excludes name, match_prefix and the ranges: those are what makes a class a
+# class, and inheriting them would be meaningless.  The point of the block is
+# that switching a whole lab between SSH and TLS is one edit rather than one
+# edit per class -- the previous shape had operators changing `protocol` in
+# every class and, in practice, missing one.
+DEFAULTABLE_CLASS_KEYS = {"controller", "protocol", "callhome_port",
+                          "lease_profile", "ca_ra", "options"}
+
 
 def die(msg):
     print(f"[ERROR] {msg}")
@@ -105,6 +115,50 @@ def die(msg):
 
 def warn(msg):
     print(f"[WARN] {msg}")
+
+
+def apply_class_defaults(cfg):
+    """Fill each oru_class from the top-level `defaults:` block, in place.
+
+    A key set on the class always wins.  Presence is what counts, not truth:
+    `ca_ra:` with no value on a class means "no CA/RA chain here" and overrides
+    an inherited one, which is how a single SSH class opts out of a TLS-by-
+    default lab.
+
+    `ca_ra` merges one level deep, so a class that only needs its own port says
+
+        ca_ra:
+          port: {ipv4: 8081, ipv6: 8080}
+
+    and keeps the inherited profile.  Nothing else merges -- scalars replace.
+    """
+    defaults = cfg.get("defaults")
+    if not defaults:
+        return
+
+    unknown = set(defaults) - DEFAULTABLE_CLASS_KEYS
+    if unknown:
+        die(f"defaults: cannot set {', '.join(sorted(unknown))} — a default "
+            f"only makes sense for a per-class setting. Allowed: "
+            f"{', '.join(sorted(DEFAULTABLE_CLASS_KEYS))}")
+
+    for cls in cfg.get("oru_classes", []):
+        for key, value in defaults.items():
+            if key not in cls:
+                # A CA/RA block is meaningless on an SSH class -- inheriting one
+                # into every SSH class of a TLS-by-default lab would emit a
+                # "ca_ra will be ignored" warning nobody asked for. Read the
+                # protocol from defaults directly so this does not depend on
+                # the order of keys in the block.
+                if key == "ca_ra" and \
+                        cls.get("protocol", defaults.get("protocol")) != "tls":
+                    continue
+                cls[key] = copy.deepcopy(value)
+            elif (key == "ca_ra"
+                  and isinstance(cls[key], dict) and isinstance(value, dict)):
+                merged = copy.deepcopy(value)
+                merged.update(cls[key])
+                cls[key] = merged
 
 
 def validate(cfg):
@@ -116,6 +170,10 @@ def validate(cfg):
     for f in REQUIRED_GLOBAL:
         if f not in cfg.get("global", {}):
             die(f"global.{f} is required")
+
+    # Classes are validated in their effective form -- after defaults are
+    # folded in -- so every check below sees what will actually be emitted.
+    apply_class_defaults(cfg)
 
     # --- controllers ---
     controllers = {}
@@ -187,7 +245,11 @@ def validate(cfg):
     for cls in classes:
         for f in REQUIRED_CLASS:
             if f not in cls:
-                die(f"oru_class '{cls.get('name','?')}' missing required field: '{f}'")
+                die(f"oru_class '{cls.get('name','?')}' missing required field: "
+                    f"'{f}'"
+                    + (f" — set it on the class, or once for every class in a "
+                       f"top-level 'defaults:' block"
+                       if f in DEFAULTABLE_CLASS_KEYS else ""))
         name = cls["name"]
         if name in names_seen:
             die(f"Duplicate oru_class name: '{name}'")
@@ -223,6 +285,19 @@ def validate(cfg):
                      f"will open a TLS connection to the SSH listener. "
                      f"Use {CALLHOME_PORTS['tls']} or 'auto' unless this is "
                      f"deliberate.")
+        elif cls["protocol"] == "tls":
+            # The failure this whole sub-option exists to prevent, and the one
+            # that reads as an O-RU fault: 0x86 says TLS, nothing says which
+            # port, so the O-RU uses its firmware default -- 4334, the SSH
+            # port, on the Fujitsu units. Not fatal: firmware that already
+            # defaults to 4335 is fine, and refusing would break configs that
+            # work today.
+            warn(f"oru_class '{name}' is protocol: tls but sets no "
+                 f"callhome_port, so no sub-option 0x87 is sent and the O-RU "
+                 f"falls back to its firmware default — 4334, the SSH "
+                 f"call-home port, on the Fujitsu units. TLS call-home then "
+                 f"never completes and the lease still looks healthy. "
+                 f"Add 'callhome_port: auto' to send {CALLHOME_PORTS['tls']}.")
 
         # New: ranges are now optional (presence enables that family)
         if "ipv4_range" not in cls and "ipv6_range" not in cls:

@@ -115,12 +115,11 @@ subnets:
 # ---------------------------------------------------------------------------
 # Turning on NETCONF call-home over TLS
 #
-# The classes above are all `protocol: ssh`. Switching one to TLS takes three
-# coordinated edits, because TLS call-home needs the O-RU to enrol a
-# certificate first (sub-options 0x01/0x03/0x04/0x05/0x06 point it at the
-# CA/RA), then call home on the TLS port (0x86 = 01 and 0x87 = 4335):
+# TLS call-home needs the O-RU to enrol a certificate first (sub-options
+# 0x01/0x03/0x04/0x05/0x06 point it at the CA/RA), then call home on the TLS
+# port (0x86 = 01 and 0x87 = 4335). Two edits:
 #
-#   1. Add a ca_ra_profiles section describing the CA/RA server:
+#   1. Describe the CA/RA server once:
 #
 #        ca_ra_profiles:
 #          att_common:
@@ -130,21 +129,31 @@ subnets:
 #            subject_dn:     "/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity"  # 0x05
 #            app_protocol:   "http"                               # sub-opt 0x06
 #
-#   2. On the class, set protocol: tls, add the call-home port, and reference
-#      the profile:
+#   2. Turn it on for every class at once with a defaults block:
 #
-#        - name: ATTn77
+#        defaults:
+#          controller: ctrl_att
 #          protocol: tls
 #          callhome_port: auto        # -> 4335 (sub-opt 0x87)
 #          ca_ra:
 #            profile: att_common
 #            port: 8080               # CA/RA server port (sub-opt 0x03)
 #
+#      Then delete the per-class `protocol: ssh` lines above, and give the
+#      catch-all `protocol: ssh` to keep it on SSH. Switching the whole lab
+#      back later is that one `protocol:` line.
+#
+#      A class needing its own CA port overrides just that -- `ca_ra: {port: N}`
+#      keeps the inherited profile. `ca_ra.port` also takes {ipv4: N, ipv6: M}
+#      when the CA answers on a different port per family.
+#
 #   3. Regenerate. Both dhcpd.conf and kea-dhcp4.conf then carry the full
 #      chain 01 03 04 05 06 81 86 87; the generator aborts if the two
 #      backends would disagree.
 #
-# A class left at `protocol: tls` with no ca_ra block is still valid — it
+# A class left at `protocol: tls` with no ca_ra block is still valid -- it
 # emits 0x81 + 0x86 (+ 0x87 if set) and suits an O-RU that already holds a
-# certificate.
+# certificate. Leaving out callhome_port on a tls class now warns: without
+# 0x87 the O-RU uses its firmware default of 4334, the SSH port, and TLS
+# call-home never completes.
 # ---------------------------------------------------------------------------

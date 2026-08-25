@@ -1,8 +1,8 @@
 # O-RAN DHCP Tools — User Guide
 
-**Version:** 4.2.0
+**Version:** 4.3.0
 **Last Updated:** 2026-08-25
-**Packages Covered:** `oran-dhcp-gen` v2.5.0 · `dhcp-oru-toolkit` v2.1.2
+**Packages Covered:** `oran-dhcp-gen` v2.6.0 · `dhcp-oru-toolkit` v2.1.2
 
 > The lease viewer was renamed. `dhcp-lease-list` 1.3.0 became the
 > `dhcp-oru-toolkit` package at 2.0.0, which ships `dhcp-lease-list` and
@@ -311,6 +311,44 @@ oru_classes:
     ipv6_range: "fd00:8b36:f2a9::180-199"
 ```
 
+### Turning TLS on and off in one edit
+
+Every class setting can be given once in a top-level `defaults:` block. A class inherits anything it does not set itself:
+
+```yaml
+defaults:
+  controller: ctrl
+  protocol: tls
+  callhome_port: auto           # -> 4335 (sub-option 0x87)
+  ca_ra:
+    profile: onefinity_ca
+    port: 8080
+
+oru_classes:
+  - name: TDDn77
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    ipv4_range: "192.168.56.100-119"       # class says only what differs
+
+  - name: Unmatched
+    match_prefix: ""
+    protocol: ssh                          # opts this one class out
+    ipv4_range: "192.168.56.180-189"
+```
+
+Changing that one `protocol:` line switches the whole lab: every class goes from the full CA/RA chain (`01 03 04 05 06 81 86 87`) to a bare controller IP (`81`), and back. Before, the same change meant editing `protocol`, `callhome_port` and `ca_ra` on every class — and the failure mode was missing one, leaving a single class on the wrong protocol while looking just like its neighbours in the YAML.
+
+Rules, all chosen so the block never surprises you:
+
+| Behaviour | Why |
+|---|---|
+| A key set on the class always wins | The default is a starting point, not an override |
+| `ca_ra:` with no value on a class overrides an inherited block with nothing | Presence is what counts, not truth — this is how one class opts out of CA/RA while staying `tls` |
+| `ca_ra` merges one level deep | A class needing only its own port writes `ca_ra: {port: N}` and keeps the inherited profile |
+| `ca_ra` is **not** inherited into an `ssh` class | It only takes effect under `tls`; inheriting it would make every SSH class warn about a block it never asked for |
+| `defaults:` rejects `name`, `match_prefix`, `ipv4_range`, `ipv6_range` | Those define a class rather than configure it |
+
+Inheritable keys: `controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra`, `options`.
+
 **Field reference:**
 
 | Field | Required | Notes |
@@ -319,7 +357,7 @@ oru_classes:
 | `match_prefix` | Yes | Vendor-class-identifier prefix. `""` = catch-all |
 | `controller` | Yes | Must match a `name` in the `controllers` list |
 | `protocol` | Yes | `ssh` or `tls` |
-| `callhome_port` | **New in 2.4.0**, no | NETCONF call-home port (sub-option 0x87). An integer, or `auto` for the RFC 8071 port matching `protocol` — SSH 4334, TLS 4335. Omit to send no 0x87 |
+| `callhome_port` | **New in 2.4.0**, no | NETCONF call-home port (sub-option 0x87). An integer, or `auto` for the RFC 8071 port matching `protocol` — SSH 4334, TLS 4335. Omitting it on a `tls` class **warns since 2.6.0**: no 0x87 goes out and the O-RU falls back to its firmware default of 4334 |
 | `ipv4_range` | **Optional since 2.2.0** | Omit to disable IPv4 for this class — no v4 class block, no v4 pool |
 | `ipv6_range` | **Optional since 2.2.0** | Omit to disable IPv6 for this class. **At least one range must be present** |
 | `lease_profile` | No | Name from `lease_profiles` |
@@ -946,6 +984,7 @@ sudo systemctl restart isc-dhcp-server
 
 | Version | Changes |
 |---------|---------|
+| 2.6.0 | **Top-level `defaults:` block** — every class inherits `controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra` and `options` unless it sets its own, so switching a lab between SSH and TLS is one edit rather than one per class. A class setting always wins; `ca_ra` merges one level deep and is not inherited into an `ssh` class. Also: a `protocol: tls` class with no `callhome_port` now warns — it is the exact case 0x87 exists to prevent, and both TLS classes in the Lab01 reference were silently in it |
 | 2.5.0 | **`ca_ra.port` accepts a per-family mapping** `{ipv4: N, ipv6: M}` for CAs reached on a different port per family; a scalar still means "both families". A mapping missing a family the class serves is rejected, not defaulted. Added `References/isc/Lab01` — a second lab's hand-written ISC configs plus the YAML that reproduces them — and a test that decodes both and requires the generated sub-option chains to match per class per family. Fixed the test helpers, which decoded a commented-out alternative chain when one sat above the live one |
 | 2.4.0 | **`callhome_port` on a class emits sub-option `0x87`**, the NETCONF call-home port — an integer or `auto` (SSH 4334, TLS 4335). Previously a class could say "use TLS" via `0x86` but not say which port, so O-RUs fell back to the firmware default of 4334 and TLS call-home never completed. Opt-in: a model that omits it is byte-identical to 2.3.0. Kea DHCPv4 now also emits T1/T2 (options 58/59) from a `lease_profile`, which it had been dropping while ISC emitted them. A `tls_ca:` block on a controller — never an implemented field, but sketched in the Lab4 reference YAML — is now a hard error pointing at `ca_ra_profiles`, and unknown fields warn instead of being silently ignored |
 | 2.3.0 | `--no-timestamp` for byte-reproducible output. Malformed or empty YAML now fails with a message rather than a traceback. Repo restructured (`bin/`, `packaging/`, `tests/`, `examples/`, `docs/`); the version is substituted from `__version__` at build time instead of living in five hand-edited places; test suite added |

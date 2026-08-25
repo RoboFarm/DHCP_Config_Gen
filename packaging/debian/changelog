@@ -1,3 +1,43 @@
+oran-dhcp-gen (2.6.0) stable; urgency=medium
+
+  * NEW top-level 'defaults:' block. Every oru_class inherits controller,
+    protocol, callhome_port, lease_profile, ca_ra and options from it unless it
+    sets its own, so switching a lab between SSH and TLS is one edit instead of
+    one edit per class:
+
+        defaults:
+          controller: ctrl
+          protocol: tls
+          callhome_port: auto
+          ca_ra:
+            profile: onefinity_ca
+
+    Turning that 'protocol' line back to ssh drops every class from the full
+    CA/RA chain to a bare controller IP. Previously the same change meant
+    editing protocol, callhome_port and ca_ra on every class in the file, and
+    the failure mode was missing one -- a single class still on ssh, or still
+    on tls, looking exactly like the others in the YAML.
+    Keys a class sets always win, and presence is what counts, not truth:
+    'ca_ra:' with no value on a class overrides an inherited block with
+    nothing. 'ca_ra' merges one level deep, so a class needing only its own
+    port keeps the inherited profile. A CA/RA block is not inherited into an
+    SSH class, which would otherwise make every SSH class in a TLS-by-default
+    lab warn about a block it never asked for. 'defaults:' rejects keys that
+    define a class rather than configure it -- name, match_prefix, the ranges.
+  * NEW a class with 'protocol: tls' and no 'callhome_port' now warns. This is
+    the failure sub-option 0x87 exists to prevent: 0x86 tells the O-RU to use
+    TLS, nothing tells it which port, so it falls back to its firmware default
+    -- 4334, the SSH call-home port, on the Fujitsu units. TLS call-home never
+    completes, the lease looks healthy, and both dhcpd -t and kea-dhcp4 -t
+    pass, so it reads as an O-RU fault. Both TLS classes in the Lab01
+    reference are in exactly this state and were silent until now.
+    A warning rather than an error: firmware that already defaults to 4335 is
+    fine, and refusing would break configs that work today.
+  * The Lab01 reference model now demonstrates 'defaults:' -- its classes
+    spell out only what differs. Generated output is unchanged.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 12:55:00 +0000
+
 oran-dhcp-gen (2.5.0) stable; urgency=medium
 
   * NEW ca_ra.port accepts a per-family mapping, not only a scalar:

@@ -53,6 +53,14 @@ via \fIca_ra: { profile: <name>, port: N, ... }\fR.
 port per family. A mapping that omits a family the class serves is an error,
 not a fallback.
 .TP
+.B defaults (optional, NEW in 2.6.0)
+Class settings applied to every oru_class that does not set its own:
+\fIcontroller\fR, \fIprotocol\fR, \fIcallhome_port\fR, \fIlease_profile\fR,
+\fIca_ra\fR, \fIoptions\fR. Switching a lab between SSH and TLS is then the
+one \fIprotocol\fR line here rather than one edit per class. A class setting
+always wins; \fIca_ra\fR merges one level deep and is not inherited into an
+\fIssh\fR class.
+.TP
 .B oru_classes
 List of O-RU classes. \fIipv4_range\fR and \fIipv6_range\fR are now
 both optional (NEW in 2.2.0); omit to disable that family for the class.

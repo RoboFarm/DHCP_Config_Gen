@@ -9,7 +9,7 @@ matches that prefix to a class and returns the NETCONF controller address in the
 vendor options — DHCPv4 **option 43** and DHCPv6 **option 17** (enterprise ID **53148**) —
 so the O-RU knows where to call home (SSH 4334 / TLS 4335).
 
-Current version: **2.5.0** · Python 3, no dependencies beyond `python3-yaml`.
+Current version: **2.6.0** · Python 3, no dependencies beyond `python3-yaml`.
 
 ## Repository layout
 
@@ -113,6 +113,9 @@ a "v2.2.3 installed" header.)
   call-home port on the Fujitsu units — and the TLS listener never sees it. Set
   `callhome_port: auto` on the class (sub-option `0x87`, NEW in 2.4.0). The field is
   opt-in: a model that omits it emits no `0x87` and its wire bytes are unchanged.
+- **A `defaults:` block turns TLS on or off lab-wide in one edit.** Classes inherit
+  `controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra` and `options` unless they
+  set their own. Editing `protocol` on every class was how one got missed.
 - `ca_ra.port` is per-class **and optionally per-family** (`{ipv4: N, ipv6: M}`). Lab01 reaches
   the same CA on v4 8081 / v6 8080, so a single scalar would send the v4 port to v6 clients.
 - Kea must emit *typed* per-sub-option data, never a pre-built blob. Versions 2.2.0–2.2.2

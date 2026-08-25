@@ -708,6 +708,179 @@ def test_ca_ra_port_mapping_must_cover_every_served_family():
 
 
 # ---------------------------------------------------------------------------
+# defaults: block -- enabling or disabling TLS lab-wide in one edit
+# ---------------------------------------------------------------------------
+
+_DEFAULTS_MODEL = """
+global:
+  default_lease_time: 43200
+  max_lease_time: 86400
+  oran_enterprise_id: 53148
+controllers:
+  - name: ctrl
+    ipv4: "192.168.36.220"
+    ipv6: "fd00:8b36:f2a9::24:dc"
+ca_ra_profiles:
+  ca:
+    ca_server_ipv4: "192.168.36.235"
+    ca_server_ipv6: "fd00:8b36:f2a9::24:eb"
+    uri_path: "/pkix/"
+    subject_dn: "/CN=Test"
+    app_protocol: "http"
+defaults:
+  controller: ctrl
+  protocol: tls
+  callhome_port: auto
+  ca_ra:
+    profile: ca
+    port: 8080
+oru_classes:
+  - name: Inherits
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    ipv4_range: "192.168.36.100-109"
+    ipv6_range: "fd00:8b36:f2a9::100-109"
+  - name: OwnPort
+    match_prefix: "o-ran-ru2/FJ/44R26"
+    ipv4_range: "192.168.36.110-119"
+    ipv6_range: "fd00:8b36:f2a9::110-119"
+    ca_ra:
+      port: 9090
+  - name: Unmatched
+    match_prefix: ""
+    protocol: ssh
+    ipv4_range: "192.168.36.180-189"
+    ipv6_range: "fd00:8b36:f2a9::180-189"
+subnets:
+  ipv4:
+    - subnet: "192.168.36.0/24"
+      gateway: "192.168.36.1"
+      interface: "eth0"
+  ipv6:
+    - subnet: "fd00:8b36:f2a9::/64"
+      interface: "eth0"
+"""
+
+
+def test_defaults_are_inherited_by_classes():
+    """A class that sets nothing gets the whole default TLS setup."""
+    tmp, files = _generate_model(_DEFAULTS_MODEL)
+    try:
+        subs = dict(isc_v4_suboptions(
+            isc_class_blocks(files["dhcpd.conf"])["Inherits"]))
+        assert sorted(subs) == [0x01, 0x03, 0x04, 0x05, 0x06, 0x81, 0x86, 0x87], \
+            "inherited class emitted %s" % sorted(hex(c) for c in subs)
+        assert _u16(subs[0x03]) == 8080, "inherited CA port"
+        assert _u16(subs[0x87]) == 4335, "inherited callhome_port: auto -> TLS"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_class_setting_overrides_the_default():
+    """protocol: ssh on one class opts it out of a TLS-by-default lab."""
+    tmp, files = _generate_model(_DEFAULTS_MODEL)
+    try:
+        subs = dict(isc_v4_suboptions(
+            isc_class_blocks(files["dhcpd.conf"])["Unmatched"]))
+        assert sorted(subs) == [0x81, 0x87], (
+            "an ssh class in a tls-default lab should carry only the "
+            "controller IP (and its port), got %s"
+            % sorted(hex(c) for c in subs))
+        assert _u16(subs[0x87]) == 4334, \
+            "callhome_port: auto must resolve per the class's own protocol"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ca_ra_merges_one_level_with_the_default():
+    """A class overriding only ca_ra.port keeps the inherited profile."""
+    tmp, files = _generate_model(_DEFAULTS_MODEL)
+    try:
+        subs = dict(isc_v4_suboptions(
+            isc_class_blocks(files["dhcpd.conf"])["OwnPort"]))
+        assert _u16(subs[0x03]) == 9090, "class port should win"
+        assert 0x04 in subs and 0x05 in subs, \
+            "the inherited profile's URI path and DN should survive the merge"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ca_ra_is_not_inherited_into_an_ssh_class():
+    """An SSH class in a TLS-default lab must not warn about an unused block.
+
+    ca_ra only takes effect under protocol: tls, so inheriting it into every
+    SSH class would emit a "ca_ra will be ignored" warning nobody asked for.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-inherit-")
+    try:
+        path = _write_yaml(tmp, _DEFAULTS_MODEL)
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(path, out, "--no-timestamp")
+        assert proc.returncode == 0
+        assert b"ca_ra will be ignored" not in proc.stdout, (
+            "inheriting ca_ra into an SSH class produced a spurious warning:\n%s"
+            % proc.stdout.decode())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_defaults_rejects_a_non_inheritable_key():
+    """ipv4_range and friends cannot be defaulted -- they define the class."""
+    tmp = tempfile.mkdtemp(prefix="oran-gen-baddef-")
+    try:
+        bad = _write_yaml(tmp, _DEFAULTS_MODEL.replace(
+            "defaults:\n  controller: ctrl",
+            'defaults:\n  ipv4_range: "192.168.36.1-9"\n  controller: ctrl'))
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(bad, out, "--no-timestamp")
+        assert proc.returncode != 0, "defaults must reject ipv4_range"
+        assert b"ipv4_range" in proc.stdout
+        assert not os.listdir(out), "must not leave partial output"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_tls_without_callhome_port_warns():
+    """The trap: 0x86 says TLS, nothing says which port.
+
+    The O-RU then uses its firmware default -- 4334, the SSH call-home port,
+    on the Fujitsu units -- and TLS call-home never completes while the lease
+    still looks healthy.  Not fatal, because firmware that already defaults to
+    4335 is fine and refusing would break configs that work today, but it must
+    not be silent.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-trap-")
+    try:
+        path = _write_yaml(tmp, _DEFAULTS_MODEL.replace(
+            "  callhome_port: auto\n", ""))
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(path, out, "--no-timestamp")
+        assert proc.returncode == 0, "this must warn, not fail"
+        text = proc.stdout.decode()
+        assert "callhome_port" in text and "4334" in text, (
+            "a tls class with no callhome_port must say so:\n%s" % text)
+        assert "Inherits" in text, "the warning should name the class"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_no_warning_when_tls_class_sets_the_port():
+    tmp = tempfile.mkdtemp(prefix="oran-gen-notrap-")
+    try:
+        path = _write_yaml(tmp, _DEFAULTS_MODEL)
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(path, out, "--no-timestamp")
+        assert b"sets no callhome_port" not in proc.stdout, (
+            "callhome_port is set lab-wide; nothing should warn:\n%s"
+            % proc.stdout.decode())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Validation: bad input must fail cleanly, never emit partial output
 # ---------------------------------------------------------------------------
 
