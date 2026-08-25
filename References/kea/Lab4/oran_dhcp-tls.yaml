@@ -3,19 +3,22 @@
 # ===========================================================================
 # Where these values came from, so nobody has to guess later:
 #
-#   ca_server_ipv4 / ca_server_ipv6   confirmed against the lab, 2026-08-25
-#   port                              confirmed against the running CMP
-#                                     endpoint on Lab04, 2026-08-25
-#   uri_path / subject_dn /           recovered from the commented-out
-#   app_protocol                      `tls_ca:` block that oran_dhcp.yaml
-#                                     carried beside this file — NOT
-#                                     re-confirmed
+# Every value below is confirmed against what Lab04 actually put on the wire
+# on 2026-08-25 — a tcpdump of the DHCP Offer to a 44R14 was decoded and
+# compared to this model sub-option by sub-option, and they match.
 #
-# That `tls_ca:` block recorded the CA at fd00:8b36:f2a9::95:240, which is
-# stale: the CA is the controller host itself. The three values still marked
-# recovered above came from that same block. They are what the O-RU uses to
-# build its CMP request path, so if enrolment fails with the addresses and
-# port correct, check those next.
+# It took two corrections to get there, both in values that had been
+# recovered from the commented-out `tls_ca:` block oran_dhcp.yaml used to
+# carry. That whole block turned out to be stale:
+#
+#   ca_server_ipv4/ipv6   ::95:240  ->  the controller host itself
+#   port                  8091      ->  8080
+#   subject_dn            /OU=SPM/O=1Finity/C=US/CN=ATT-SSL/...
+#                                   ->  /CN=1FinityLab Root CA/...
+#
+# uri_path (/pkix/) and app_protocol (http) came from the same block and
+# happened to be right. The subject DN is now the same one Lab01 and Lab03
+# send, so all three labs share the root CA.
 #
 # To see exactly what an O-RU will be sent, without writing anything:
 #     oran-dhcp-gen oran_dhcp-tls.yaml --explain
@@ -54,7 +57,7 @@ ca_ra_profiles:
     ca_server_ipv4: "192.168.44.6"             # sub-opt 0x01, IPv4 output
     ca_server_ipv6: "fd00:8b36:f2a9::2c:6"     # sub-opt 0x01, IPv6 output
     uri_path:       "/pkix/"                                   # sub-opt 0x04
-    subject_dn:     "/OU=SPM/O=1Finity/C=US/CN=ATT-SSL/L=WV/ST=Texas"  # 0x05
+    subject_dn:     "/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity/L=Richardson/ST=Texas/C=US"  # 0x05
     app_protocol:   "http"                                     # sub-opt 0x06
 
 # ---------------------------------------------------------------------------
@@ -69,8 +72,8 @@ defaults:
                                  # the SSH port, and TLS never completes.
   ca_ra:
     profile: att_spm
-    port: 8091                   # CA/RA port (sub-opt 0x03), confirmed
-                                 # against the running CMP endpoint
+    port: 8080                   # CA/RA port (sub-opt 0x03), confirmed
+                                 # on the wire
 
 oru_classes:
 

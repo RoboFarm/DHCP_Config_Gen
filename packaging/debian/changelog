@@ -1,3 +1,30 @@
+oran-dhcp-gen (2.8.3) stable; urgency=medium
+
+  * FIX the Lab4 TLS model carried two wrong values, and 2.8.2 wrongly
+    recorded one of them as confirmed. Lab04 deployed the model and a tcpdump
+    of the DHCP Offer to a 44R14 was decoded against it:
+
+        0x03 CA/RA port    model 8091   wire 8080
+        0x05 subject DN    model /OU=SPM/O=1Finity/C=US/CN=ATT-SSL/...
+                           wire  /CN=1FinityLab Root CA/OU=WV Lab/...
+
+    Both came from the commented-out `tls_ca:` block in oran_dhcp.yaml, which
+    is stale in every value it recorded: the CA address was wrong (fixed in
+    2.8.2), and so were the port and the subject DN. uri_path and
+    app_protocol came from the same block and happen to be right.
+    2.8.2's header claimed the port was "confirmed against the running CMP
+    endpoint" on the strength of a report that it had been checked; the
+    capture shows it had been checked and corrected, not confirmed. Recording
+    a value as verified on second-hand wording is the same failure this tool
+    exists to prevent, one level up.
+  * The model is now byte-identical to what Lab04 serves: the generated
+    option 43 for ATTn77 matches the 108 bytes captured on br-mplane exactly.
+    The header records that, and which two values had to move to get there.
+  * The subject DN is now the same one Lab01 and Lab03 send, so all three
+    labs share the 1FinityLab root CA.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 18:45:00 +0000
+
 oran-dhcp-gen (2.8.2) stable; urgency=medium
 
   * The Lab4 TLS model now carries the lab's real CA/RA addresses, confirmed
