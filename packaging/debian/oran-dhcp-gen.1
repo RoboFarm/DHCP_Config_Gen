@@ -20,6 +20,14 @@ Output target (default: isc).
 .B \-\-outdir DIR
 Output directory (default: temp dir when --deploy, current dir otherwise).
 .TP
+.B \-\-explain
+Print what each O-RU class will actually receive \-\- the vendor-class prefix
+it matches, its pool range, and the option 43 / option 17 chain decoded
+sub-option by sub-option, followed by the flat hex for comparison against a
+capture \-\- and write nothing. Flags a \fItls\fR class that sends no 0x87
+with the port the O-RU will fall back to. Cannot be combined with
+\-\-deploy or \-\-restart.
+.TP
 .B \-\-deploy
 Deploy generated configs to system paths with timestamped backups.
 Requires root/sudo to write to /etc/dhcp/, /etc/kea/, /etc/default/.

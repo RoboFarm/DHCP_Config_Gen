@@ -1,3 +1,29 @@
+oran-dhcp-gen (2.7.0) stable; urgency=medium
+
+  * NEW --explain prints what each O-RU class will actually receive and writes
+    nothing:
+
+        oran-dhcp-gen oran_dhcp.yaml --explain
+
+    Per class and family: the vendor-class prefix it matches, its pool range,
+    and the option 43 / option 17 chain decoded sub-option by sub-option --
+    CA/RA server and port, URI path, subject DN, controller IP, call-home mode
+    and port -- followed by the flat hex so it can be compared against a
+    capture. Until now the only way to see what a class sends was to read a hex
+    chain out of the generated config by hand, or to put an O-RU on the wire
+    and run tcpdump.
+    The report is built on resolve_suboptions(), the same structured form the
+    Kea backend consumes and which is byte-checked against the ISC builders
+    before anything is emitted, so it cannot disagree with what is generated.
+    test_explain_wire_matches_the_generated_config decodes both and compares
+    them for every class and family in all three reference models.
+    It also flags what a byte dump alone would not: a TLS class sending no
+    0x87 is called out with the port the O-RU will fall back to, and a TLS
+    class with no ca_ra block is noted as controller-only.
+    --explain cannot be combined with --deploy or --restart.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 14:05:00 +0000
+
 oran-dhcp-gen (2.6.0) stable; urgency=medium
 
   * NEW top-level 'defaults:' block. Every oru_class inherits controller,

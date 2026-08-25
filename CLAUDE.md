@@ -87,7 +87,9 @@ tests/golden/` before committing.
 | `isc-dhcp-server` | `/etc/default/` |
 | `kea-dhcp4.conf`, `kea-dhcp6.conf` | `/etc/kea/` |
 
-Pipeline inside the script: `validate()` → range parsers → **TLV resolution** → five `gen_*()` emitters → optional deploy/restart.
+Pipeline inside the script: `validate()` → range parsers → **TLV resolution** → five `gen_*()` emitters → optional deploy/restart. `--explain` short-circuits after `validate()`: it renders the resolved sub-options and writes nothing.
+
+- `explain()` reads `resolve_suboptions()` / `resolve_tlv()`, the same values the emitters use, so the report cannot disagree with the generated configs. `test_explain_wire_matches_the_generated_config` decodes both and compares them per class per family — keep it that way rather than re-deriving bytes inside `explain()`.
 
 - `validate(cfg)` returns three name-keyed lookup dicts — `(controllers, lease_profiles, ca_ra_profiles)` — that every emitter threads through. All errors call `die()` (print + `sys.exit(1)`); the generator never emits partial output.
 - **Two parallel representations of the same O-RAN vendor options exist**, and this is the central design constraint:

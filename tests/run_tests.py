@@ -881,6 +881,124 @@ def test_no_warning_when_tls_class_sets_the_port():
 
 
 # ---------------------------------------------------------------------------
+# --explain
+# ---------------------------------------------------------------------------
+
+def _explain(yaml_path, *extra):
+    proc = subprocess.run(
+        [sys.executable, GEN, yaml_path, "--explain", *extra],
+        cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=120)
+    assert proc.returncode == 0, proc.stdout.decode()
+    return proc.stdout.decode()
+
+
+def _explain_wire_lines(text):
+    """{(class, family): wire hex} from an --explain report."""
+    out, cls, family = {}, None, None
+    for line in text.splitlines():
+        m = re.match(r'^(\S+)(   — |$)', line)
+        if m and not line.startswith((' ', '=', '[')):
+            cls = m.group(1)
+        m = re.match(r'^  (ipv4|ipv6)\s', line)
+        if m:
+            family = m.group(1)
+        m = re.match(r'^\s+wire: (\S+)$', line)
+        if m and cls and family:
+            out[(cls, family)] = m.group(1)
+    return out
+
+
+def test_explain_wire_matches_the_generated_config():
+    """Every `wire:` line must be the chain the config actually carries.
+
+    --explain is only worth having if it cannot disagree with what is emitted.
+    It is built on resolve_suboptions(), the same structured form the Kea
+    backend consumes, so this checks the report against the ISC files rather
+    than against itself.
+    """
+    for name, src in INPUTS.items():
+        text = _explain(src)
+        wire = _explain_wire_lines(text)
+        assert wire, "%s: --explain produced no wire lines" % name
+
+        tmp = tempfile.mkdtemp(prefix="oran-gen-explain-")
+        try:
+            generate_ok(src, tmp, "--no-timestamp")
+            for fname, family, decode in (
+                ("dhcpd.conf", "ipv4", isc_v4_suboptions),
+                ("dhcpd6.conf", "ipv6", isc_v6_suboptions),
+            ):
+                blocks = isc_class_blocks(open(os.path.join(tmp, fname)).read())
+                for cls, block in blocks.items():
+                    subs = decode(block)
+                    if subs is None:
+                        continue
+                    hdr = 2 if family == "ipv4" else 4
+                    raw = b"".join(
+                        (bytes([c, len(v)]) if family == "ipv4"
+                         else bytes([c >> 8, c & 0xFF, len(v) >> 8, len(v) & 0xFF]))
+                        + v for c, v in subs)
+                    want = ":".join("%02x" % b for b in raw)
+                    got = wire.get((cls, family))
+                    assert got is not None, (
+                        "%s: --explain reported no %s chain for class %r"
+                        % (name, family, cls))
+                    assert got == want, (
+                        "%s class %r (%s): --explain says\n  %s\nbut %s carries\n  %s"
+                        % (name, cls, family, got, fname, want))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_explain_writes_nothing():
+    tmp = tempfile.mkdtemp(prefix="oran-gen-explain-ro-")
+    try:
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = subprocess.run(
+            [sys.executable, GEN, INPUTS["lab01"], "--explain",
+             "--outdir", out, "--target", "all"],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=120)
+        assert proc.returncode == 0, proc.stdout.decode()
+        assert not os.listdir(out), \
+            "--explain must not write files, found %s" % os.listdir(out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_explain_flags_a_tls_class_with_no_callhome_port():
+    """The report has to surface the trap, not just list bytes."""
+    text = _explain(INPUTS["lab01"])
+    assert "no 0x87" in text, \
+        "Lab01's TLS classes send no 0x87; --explain should say so:\n%s" % text
+    assert "4334" in text and "4335" in text, \
+        "the flag should name both the wrong default and the right port"
+
+
+def test_explain_refuses_to_deploy():
+    proc = subprocess.run(
+        [sys.executable, GEN, INPUTS["lab01"], "--explain", "--deploy"],
+        cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=120)
+    assert proc.returncode != 0, "--explain --deploy should be refused"
+    assert b"Traceback" not in proc.stdout
+
+
+def test_explain_covers_every_class_and_names_unserved_families():
+    """A class absent from the report is worse than no report at all."""
+    text = _explain(INPUTS["example"])
+    import yaml as _yaml
+    model = _yaml.safe_load(open(INPUTS["example"]))
+    for cls in model["oru_classes"]:
+        assert re.search(r'^%s(   — |$)' % re.escape(cls["name"]), text, re.M), \
+            "--explain omitted class %r" % cls["name"]
+    assert "not served (no ipv4_range)" in text, \
+        "a class with no ipv4_range should be shown as not served on that family"
+
+
+# ---------------------------------------------------------------------------
 # Validation: bad input must fail cleanly, never emit partial output
 # ---------------------------------------------------------------------------
 

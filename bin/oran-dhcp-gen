@@ -55,7 +55,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -659,6 +659,21 @@ KEA_SUBOPT_DEFS = {
     0x86: ("oran-netconf-mode",      {"ipv4": "uint8",        "ipv6": "uint8"}),
     0x87: ("oran-netconf-callhome-port",
                                      {"ipv4": "uint16",       "ipv6": "uint16"}),
+}
+
+
+# Human labels for --explain.  Kept beside KEA_SUBOPT_DEFS so a new
+# sub-option is obvious if it lands in one table and not the other.
+SUBOPT_LABELS = {
+    0x01: "CA/RA server IP",
+    0x03: "CA/RA port",
+    0x04: "CA/RA URI path",
+    0x05: "CA/RA subject DN",
+    0x06: "CA/RA protocol",
+    0x81: "Controller IP",
+    0x82: "M-plane FQDN",
+    0x86: "Call-home mode",
+    0x87: "Call-home port",
 }
 
 
@@ -1347,6 +1362,97 @@ def gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles):
 
 
 # ---------------------------------------------------------------------------
+# --explain: what each class actually sends
+#
+# Built on resolve_suboptions(), the same structured form the Kea emitter
+# consumes and which is byte-checked against the ISC builders before anything
+# is written.  So this cannot drift from what is emitted: if it did, generation
+# would already be refusing to run.
+# ---------------------------------------------------------------------------
+
+def _explain_value(s):
+    """Render one structured sub-option's value for a human."""
+    code, data = s["code"], s["data"]
+    if code == 0x86:
+        return f"{'TLS' if str(data) == '1' else 'SSH'}  (0x{int(data):02x})"
+    if code == 0x87:
+        proto = {v: k for k, v in CALLHOME_PORTS.items()}.get(int(data))
+        return f"{data}" + (f"  ({proto.upper()} call-home)" if proto else "")
+    if s["type"] == "string":
+        return f'"{data}"'
+    return str(data)
+
+
+def explain(cfg, controllers, lease_profiles, ca_ra_profiles):
+    """Print, per class and family, the vendor option an O-RU will receive."""
+    eid     = cfg["global"]["oran_enterprise_id"]
+    classes = cfg.get("oru_classes", [])
+
+    print(f"\n{'=' * 72}")
+    print(f"What each O-RU class receives — oran-dhcp-gen v{__version__}")
+    print(f"{'=' * 72}")
+
+    for cls in classes:
+        name   = cls["name"]
+        prefix = cls["match_prefix"]
+        ctrl   = controllers[cls["controller"]]
+        proto  = cls["protocol"]
+
+        print(f"\n{name}"
+              + (f"   — {cls['description']}" if cls.get("description") else ""))
+        if prefix == "":
+            print(f'  matches   anything not matched above (catch-all)')
+        else:
+            print(f'  matches   vendor class starting "{prefix}"  '
+                  f'({len(prefix)} bytes)')
+        detail = f"  protocol  {proto}    controller {cls['controller']}"
+        if cls.get("lease_profile"):
+            detail += f"    lease_profile {cls['lease_profile']}"
+        print(detail)
+        mtu = (cls.get("options") or {}).get("interface_mtu")
+        if mtu:
+            print(f"  option 26 interface-mtu {mtu}  (IPv4 only)")
+
+        for family, range_key, opt_desc in (
+            ("ipv4", "ipv4_range", "DHCPv4 option 43"),
+            ("ipv6", "ipv6_range", f"DHCPv6 option 17, enterprise {eid}"),
+        ):
+            if range_key not in cls:
+                print(f"  {family:<9} not served (no {range_key})")
+                continue
+            parser = parse_ipv4_range if family == "ipv4" else parse_ipv6_range
+            start, end = parser(cls[range_key], name)
+            subs = resolve_suboptions(family, cls, controllers, ca_ra_profiles)
+            _, hex_str, raw = resolve_tlv(family, cls, controllers, ca_ra_profiles)
+
+            print(f"  {family:<9} {start} - {end}")
+            print(f"            {opt_desc} — {len(raw)} bytes, "
+                  f"{len(subs)} sub-option(s)")
+            for s_ in subs:
+                label = SUBOPT_LABELS.get(s_["code"], "?")
+                print(f"              0x{s_['code']:02x}  {label:<18} "
+                      f"{_explain_value(s_)}")
+            print(f"            wire: {hex_str}")
+
+        if proto == "tls" and resolve_callhome_port(cls) is None:
+            print(f"  !         no 0x87: the O-RU picks its own call-home port. "
+                  f"Firmware defaulting to\n"
+                  f"            {CALLHOME_PORTS['ssh']} (the SSH port) will "
+                  f"never complete a TLS session. Add\n"
+                  f"            'callhome_port: auto' to send "
+                  f"{CALLHOME_PORTS['tls']}.")
+        if proto == "tls" and cls.get("ca_ra") is None:
+            print(f"  note      no ca_ra block: only the controller IP and mode "
+                  f"go out. Correct for\n"
+                  f"            an O-RU that already holds a certificate; add "
+                  f"'ca_ra:' if it must enrol.")
+
+    print(f"\n{'=' * 72}")
+    print("Nothing was written — --explain only reports.")
+    print(f"{'=' * 72}\n")
+
+
+# ---------------------------------------------------------------------------
 # Deploy helpers
 # ---------------------------------------------------------------------------
 
@@ -1413,6 +1519,10 @@ def main():
     parser.add_argument("--outdir", default=None,
                         help="Output directory (default: temp dir with --deploy, "
                              "current dir otherwise)")
+    parser.add_argument("--explain", action="store_true",
+                        help="Print what each O-RU class will actually receive "
+                             "— the decoded option 43 / option 17 sub-options "
+                             "per class per family — and write nothing")
     parser.add_argument("--deploy", action="store_true",
                         help="Deploy generated configs to system paths "
                              "with timestamped backups")
@@ -1432,6 +1542,9 @@ def main():
 
     if args.restart and not args.deploy:
         die("--restart requires --deploy to be specified")
+    if args.explain and (args.deploy or args.restart):
+        die("--explain only reports; it cannot be combined with "
+            "--deploy or --restart")
 
     yaml_path = Path(args.input)
     if not yaml_path.exists():
@@ -1450,6 +1563,10 @@ def main():
     print(f"[INFO] Loaded: {yaml_path}")
 
     controllers, lease_profiles, ca_ra_profiles = validate(cfg)
+
+    if args.explain:
+        explain(cfg, controllers, lease_profiles, ca_ra_profiles)
+        return
 
     if args.deploy and args.outdir is None:
         import tempfile
