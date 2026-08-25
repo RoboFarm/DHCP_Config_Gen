@@ -2,7 +2,7 @@
 
 **Version:** 4.5.0
 **Last Updated:** 2026-08-25
-**Packages Covered:** `oran-dhcp-gen` v2.8.3 · `dhcp-oru-toolkit` v2.1.2
+**Packages Covered:** `oran-dhcp-gen` v2.8.4 · `dhcp-oru-toolkit` v2.1.2
 
 > The lease viewer was renamed. `dhcp-lease-list` 1.3.0 became the
 > `dhcp-oru-toolkit` package at 2.0.0, which ships `dhcp-lease-list` and
@@ -517,6 +517,16 @@ Some deployments front the same CMP endpoint on a different port per family. Giv
 ```
 
 Sub-option 0x03 then carries 8081 in `dhcpd.conf` / `kea-dhcp4.conf` and 8080 in `dhcpd6.conf` / `kea-dhcp6.conf`. If the mapping omits a family the class actually serves — an `ipv4_range` is present but no `ipv4` port — generation fails rather than falling back, because a silent fallback sends the wrong port to that family and the O-RU's CMP enrolment fails with a config that still validates.
+
+> **A dual-stack O-RU calls home over IPv6.** If a class serves both families the O-RU takes an address on each, and it is the **IPv6** chain that governs call-home. For such a class the IPv6 CA address, the IPv6 controller and the `ipv6` entry of a per-family `ca_ra.port` are the values that actually reach the radio — the IPv4 chain is emitted and largely ignored.
+>
+> This matters most when verifying a deployment. A DHCPv4 capture showing a correct option 43 proves the generator emitted what you asked for; it does not prove the path the O-RU is using. Capture DHCPv6 as well:
+>
+> ```bash
+> sudo tcpdump -i <mplane-if> -vvv -s0 'port 546 or port 547' -c 4
+> ```
+>
+> and decode the option 17 payload against `--explain`'s `ipv6` section for the same class.
 
 #### Sub-option coverage and its basis
 
@@ -1070,6 +1080,9 @@ sudo systemctl restart isc-dhcp-server
 
 | Version | Changes |
 |---------|---------|
+| 2.8.4 | Recorded a domain rule that changes how a deployment should be verified: a **dual-stack O-RU calls home over IPv6**, so for a class serving both families the option 17 chain is the operative one and a DHCPv4-only capture does not prove the path in use |
+| 2.8.3 | Corrected the Lab4 TLS model against Lab04's actual wire bytes — CA/RA port `8091 → 8080` and the subject DN to the 1FinityLab root CA. Both had been recovered from the stale `tls_ca:` block, and 2.8.2 had wrongly recorded the port as confirmed. The model's option 43 is now byte-identical to what Lab04 serves |
+| 2.8.2 | Set the Lab4 TLS model's real CA/RA addresses (`192.168.44.6` / `fd00:8b36:f2a9::2c:6`) in place of 2.8.1's placeholder. The CA runs on the controller host, so `0x01` and `0x81` carry the same address |
 | 2.8.1 | Added `References/kea/Lab4/oran_dhcp-tls.yaml` — the Lab4 model with TLS call-home actually enabled, CA/RA settings recovered from the `tls_ca:` block that file used to carry commented out. Its catch-all stays on SSH and byte-identical. Also: a malformed address in the model now fails validation naming the field instead of surfacing as an `ipaddress` traceback from inside a TLV builder |
 | 2.8.0 | **Sub-option `0x02` (CA/RA server FQDN)**, via `ca_ra_profile.ca_server_fqdn` — reaches the CA by name and serves both families from one value. A profile must now offer an address or a FQDN, and an address-only profile must cover every family its classes serve. Includes an audit of the emitter's sub-option coverage against the evidence available (see [Sub-option coverage and its basis](#sub-option-coverage-and-its-basis)) |
 | 2.7.0 | **`--explain`** prints what each class will actually receive — match prefix, pool range, and the option 43 / 17 chain decoded sub-option by sub-option, plus the flat hex — and writes nothing. Flags a `tls` class sending no 0x87 with the port the O-RU will fall back to. Built on the same resolved sub-options the emitters use, and checked against the generated configs by test, so it cannot drift from what is emitted |

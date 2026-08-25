@@ -1,3 +1,25 @@
+oran-dhcp-gen (2.8.4) stable; urgency=medium
+
+  * Recorded a domain rule that changes how a deployment should be verified:
+    a dual-stack O-RU calls home over IPv6. When a class serves both families
+    the O-RU takes an address on each and the IPv6 chain governs call-home, so
+    option 17 is the operative payload and option 43 is not what the radio
+    acts on.
+    Three consequences worth having written down. For such a class the IPv6 CA
+    address, IPv6 controller and the ipv6 entry of a per-family ca_ra.port are
+    the values that reach the radio. A per-family port mapping is therefore
+    decided by its ipv6 entry. And a DHCPv4 capture -- which is what confirmed
+    the Lab04 deployment in 2.8.3 -- proves the generator emitted what was
+    asked for, but says nothing about the path actually in use; confirming a
+    dual-stack deployment needs a DHCPv6 capture (port 546 or 547) decoded
+    against --explain's ipv6 section.
+    Documentation only; no generated output changes. It is recorded because
+    the verification claims in this changelog read stronger than they are
+    without it.
+  * The user guide's version table was missing rows for 2.8.2 and 2.8.3; added.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 19:05:00 +0000
+
 oran-dhcp-gen (2.8.3) stable; urgency=medium
 
   * FIX the Lab4 TLS model carried two wrong values, and 2.8.2 wrongly
