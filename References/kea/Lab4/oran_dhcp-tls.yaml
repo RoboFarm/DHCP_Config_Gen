@@ -1,20 +1,20 @@
 # oran_dhcp.yaml — Lab4 with NETCONF call-home over TLS enabled
 #
 # ===========================================================================
-# BEFORE YOU DEPLOY THIS: confirm ONE value — ca_server_ipv4.
+# Where these values came from, so nobody has to guess later:
 #
-# The CA/RA settings below were recovered from the commented-out `tls_ca:`
-# block that shipped in oran_dhcp.yaml alongside this file. That block
-# recorded only an IPv6 CA address. Every class here serves IPv4 as well, so
-# an IPv4 CA address is required, and the value below is a PLACEHOLDER chosen
-# to sit in this lab's subnet — it was not recovered from anything.
+#   ca_server_ipv4 / ca_server_ipv6   confirmed by the lab operator, 2026-08-25
+#   port / uri_path / subject_dn /    recovered from the commented-out
+#   app_protocol                      `tls_ca:` block that oran_dhcp.yaml
+#                                     carried beside this file
 #
-# Check it before generating:
-#     oran-dhcp-gen oran_dhcp-tls.yaml --explain | grep -A1 'CA/RA server IP'
+# That `tls_ca:` block recorded the CA at fd00:8b36:f2a9::95:240. The CA is
+# now the controller host itself, so that address is stale and the rest of
+# the block — port 8091 in particular — is worth re-checking against the
+# running CMP endpoint before an enrolment run.
 #
-# If the CA is IPv6-only, delete ca_server_ipv4 and the ipv4_range from the
-# two ATT classes; the generator will then refuse any IPv4 class that has no
-# way to reach the CA rather than emitting a chain that cannot enrol.
+# To see exactly what an O-RU will be sent, without writing anything:
+#     oran-dhcp-gen oran_dhcp-tls.yaml --explain
 # ===========================================================================
 #
 # This file is oran_dhcp.yaml with TLS turned on. It is kept separate rather
@@ -46,9 +46,9 @@ controllers:
 # ---------------------------------------------------------------------------
 ca_ra_profiles:
   att_spm:
-    description: "ATT/1Finity SPM CA"
-    ca_server_ipv4: "192.168.44.240"    # <-- PLACEHOLDER, CONFIRM. sub-opt 0x01
-    ca_server_ipv6: "fd00:8b36:f2a9::95:240"   # recovered.      sub-opt 0x01
+    description: "ATT/1Finity SPM CA — runs on the controller host"
+    ca_server_ipv4: "192.168.44.6"             # sub-opt 0x01, IPv4 output
+    ca_server_ipv6: "fd00:8b36:f2a9::2c:6"     # sub-opt 0x01, IPv6 output
     uri_path:       "/pkix/"                                   # sub-opt 0x04
     subject_dn:     "/OU=SPM/O=1Finity/C=US/CN=ATT-SSL/L=WV/ST=Texas"  # 0x05
     app_protocol:   "http"                                     # sub-opt 0x06
@@ -65,7 +65,9 @@ defaults:
                                  # the SSH port, and TLS never completes.
   ca_ra:
     profile: att_spm
-    port: 8091                   # CA/RA port (sub-opt 0x03), recovered
+    port: 8091                   # CA/RA port (sub-opt 0x03). Recovered from
+                                 # the old tls_ca block, not re-confirmed —
+                                 # see the header.
 
 oru_classes:
 

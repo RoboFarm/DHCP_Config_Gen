@@ -1,3 +1,19 @@
+oran-dhcp-gen (2.8.2) stable; urgency=medium
+
+  * The Lab4 TLS model now carries the lab's real CA/RA addresses, confirmed
+    by the operator: 192.168.44.6 and fd00:8b36:f2a9::2c:6. The placeholder
+    IPv4 address 2.8.1 shipped is gone.
+    Worth recording: the CA runs on the controller host itself, so 0x01 and
+    0x81 carry the same address on each family -- the same arrangement Lab01
+    uses, and unlike Lab03 where they are separate hosts.
+    Also worth recording: the commented-out `tls_ca:` block those settings
+    were otherwise recovered from named the CA at fd00:8b36:f2a9::95:240,
+    which is stale. The file's header now says which values are confirmed and
+    which are only recovered, and flags port 8091 -- which came from that same
+    stale block -- as not re-confirmed.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 15:35:00 +0000
+
 oran-dhcp-gen (2.8.1) stable; urgency=medium
 
   * NEW References/kea/Lab4/oran_dhcp-tls.yaml -- the Lab4 model with NETCONF
