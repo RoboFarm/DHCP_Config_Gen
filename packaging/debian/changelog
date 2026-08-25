@@ -1,3 +1,42 @@
+oran-dhcp-gen (2.8.0) stable; urgency=medium
+
+  * NEW sub-option 0x02, CA/RA server FQDN, via a ca_ra_profile's
+    'ca_server_fqdn'. It reaches the CA by name and serves both families from
+    one value, so a profile can drop its per-family addresses entirely:
+
+        ca_ra_profiles:
+          onefinity_ca:
+            ca_server_fqdn: "ca.mplane.local"
+            uri_path:       "/pkix/"
+            subject_dn:     "/CN=1FinityLab Root CA/..."
+            app_protocol:   "http"
+
+    Setting both an address and a FQDN emits 0x01 then 0x02, in code order.
+  * A ca_ra_profile must now offer at least one of ca_server_ipv4,
+    ca_server_ipv6 or ca_server_fqdn, and an address-only profile must carry
+    the address family every referring class actually serves. Before, an
+    IPv4-only profile referenced by a dual-stack class produced a v6 CA/RA
+    chain with no CA address in it -- a config that validates and cannot
+    enrol.
+  * Audited the emitter's sub-option coverage and wrote the result into the
+    user guide, with the basis for each mapping stated rather than asserted.
+    Nine of the ten codes are verified against working lab configs: Lab03 is
+    decisive for 0x01 vs 0x81 because its CA and controller are different
+    hosts, and it carries 0x82 as the named alternative to 0x81.
+    0x02 is the exception and is documented as inferred, not read from the
+    spec: it fills the only gap in the 0x01-0x06 CA/RA run and mirrors 0x82
+    against 0x81. O-RAN.WG4.MP.0 clause 6.2.5 could not be retrieved to
+    confirm it, and one public summary of an early revision describes the low
+    codes as controller rather than CA/RA information -- a reading that
+    contradicts how both labs use 0x01, and most likely describes a revision
+    in which option 43 carried controller information only. Confirm 0x02
+    against the specification before relying on it in production.
+    Nothing claims the ten codes are the complete set.
+  * The reference models deliberately do not use 0x02, so no shipped example
+    endorses an unverified mapping; it is covered by inline test models only.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 14:55:00 +0000
+
 oran-dhcp-gen (2.7.0) stable; urgency=medium
 
   * NEW --explain prints what each O-RU class will actually receive and writes

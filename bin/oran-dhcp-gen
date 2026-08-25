@@ -55,7 +55,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -211,9 +211,11 @@ def validate(cfg):
             die(f"ca_ra_profile '{name}' is empty")
         # Required for either family that's used:
         # ca_server_ipv4 OR ca_server_ipv6 must be present
-        if "ca_server_ipv4" not in prof and "ca_server_ipv6" not in prof:
+        if not any(k in prof for k in
+                   ("ca_server_ipv4", "ca_server_ipv6", "ca_server_fqdn")):
             die(f"ca_ra_profile '{name}' must define at least one of "
-                f"ca_server_ipv4 or ca_server_ipv6")
+                f"ca_server_ipv4, ca_server_ipv6 or ca_server_fqdn — the O-RU "
+                f"needs some way to reach the CA/RA server")
         for f in ("uri_path", "subject_dn", "app_protocol"):
             if f not in prof:
                 die(f"ca_ra_profile '{name}' missing required field: '{f}'")
@@ -322,6 +324,21 @@ def validate(cfg):
                 die(f"oru_class '{name}' ca_ra block missing required field: 'profile'")
             if ca_ra["profile"] not in ca_ra_profiles:
                 die(f"oru_class '{name}' ca_ra references undefined profile: '{ca_ra['profile']}'")
+            # A profile carrying only an FQDN serves both families. One
+            # carrying only addresses must carry the address family this
+            # class actually serves, or the O-RU is handed a chain with no
+            # way to reach the CA.
+            prof = ca_ra_profiles[ca_ra["profile"]]
+            if not prof.get("ca_server_fqdn"):
+                for fam, range_key, ip_key in (
+                    ("ipv4", "ipv4_range", "ca_server_ipv4"),
+                    ("ipv6", "ipv6_range", "ca_server_ipv6"),
+                ):
+                    if range_key in cls and ip_key not in prof:
+                        die(f"oru_class '{name}' serves {fam} and uses ca_ra "
+                            f"profile '{ca_ra['profile']}', which defines "
+                            f"neither {ip_key} nor ca_server_fqdn — the {fam} "
+                            f"chain would carry no CA/RA address")
             if "port" not in ca_ra:
                 die(f"oru_class '{name}' ca_ra block missing required field: 'port'")
 
@@ -480,6 +497,7 @@ def build_option17_chunks_simple(ctrl_ipv6, protocol, callhome_port=None):
 # Code  IPv4 hdr   IPv6 hdr   Field                 Source
 # ----  ---------  ---------  --------------------  -----------------------
 # 0x01  01:LL      00:01:LL   CA server IP          ca_ra_profile
+# 0x02  02:LL      00:02:LL   CA server FQDN (str)  ca_ra_profile (optional)
 # 0x03  03:LL      00:03:LL   CA port (uint16 BE)   class.ca_ra.port
 # 0x04  04:LL      00:04:LL   URI path (string)     ca_ra_profile
 # 0x05  05:LL      00:05:LL   Subject DN (string)   ca_ra_profile
@@ -543,17 +561,18 @@ def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol,
     subopt = _v4_subopt if is_v4 else _v6_subopt
     chunks = []
 
-    # 0x01: CA server IP (always present)
-    if is_v4:
-        ca_ip = profile.get("ca_server_ipv4")
-        if ca_ip is None:
-            die(f"ca_ra_profile must define ca_server_ipv4 to emit IPv4 sub-options")
-        chunks.append(subopt(0x01, ipaddress.IPv4Address(ca_ip).packed))
-    else:
-        ca_ip = profile.get("ca_server_ipv6")
-        if ca_ip is None:
-            die(f"ca_ra_profile must define ca_server_ipv6 to emit IPv6 sub-options")
-        chunks.append(subopt(0x01, ipaddress.IPv6Address(ca_ip).packed))
+    # 0x01: CA server IP, 0x02: CA server FQDN. The O-RU needs at least one
+    # way to reach the CA; validate() has already checked that this profile
+    # gives it one for this family.
+    ip_key = "ca_server_ipv4" if is_v4 else "ca_server_ipv6"
+    ca_ip  = profile.get(ip_key)
+    if ca_ip is not None:
+        packed = (ipaddress.IPv4Address(ca_ip).packed if is_v4
+                  else ipaddress.IPv6Address(ca_ip).packed)
+        chunks.append(subopt(0x01, packed))
+    ca_fqdn = profile.get("ca_server_fqdn")
+    if ca_fqdn:
+        chunks.append(subopt(0x02, ca_fqdn.encode("ascii")))
 
     # 0x03: CA port (per-family since 2.5.0)
     port = resolve_ca_ra_port(ca_ra_class, family)
@@ -650,6 +669,7 @@ def resolve_tlv(family, cls, controllers, ca_ra_profiles):
 # code -> (kea option name, {family: kea type})
 KEA_SUBOPT_DEFS = {
     0x01: ("oran-ca-server-ip",      {"ipv4": "ipv4-address", "ipv6": "ipv6-address"}),
+    0x02: ("oran-ca-server-fqdn",    {"ipv4": "string",       "ipv6": "string"}),
     0x03: ("oran-ca-port",           {"ipv4": "uint16",       "ipv6": "uint16"}),
     0x04: ("oran-ca-uri-path",       {"ipv4": "string",       "ipv6": "string"}),
     0x05: ("oran-ca-subject-dn",     {"ipv4": "string",       "ipv6": "string"}),
@@ -666,6 +686,7 @@ KEA_SUBOPT_DEFS = {
 # sub-option is obvious if it lands in one table and not the other.
 SUBOPT_LABELS = {
     0x01: "CA/RA server IP",
+    0x02: "CA/RA server FQDN",
     0x03: "CA/RA port",
     0x04: "CA/RA URI path",
     0x05: "CA/RA subject DN",
@@ -701,12 +722,14 @@ def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol,
     ip_key  = "ipv4" if is_v4 else "ipv6"
     ca_key  = "ca_server_ipv4" if is_v4 else "ca_server_ipv6"
 
+    subs = []
     ca_ip = profile.get(ca_key)
-    if ca_ip is None:
-        die(f"ca_ra_profile must define {ca_key} to emit {family} sub-options")
-
-    subs = [
-        _subopt_struct(0x01, ip_type, ca_ip),
+    if ca_ip is not None:
+        subs.append(_subopt_struct(0x01, ip_type, ca_ip))
+    ca_fqdn = profile.get("ca_server_fqdn")
+    if ca_fqdn:
+        subs.append(_subopt_struct(0x02, "string", ca_fqdn))
+    subs += [
         _subopt_struct(0x03, "uint16", str(resolve_ca_ra_port(ca_ra_class, family))),
         _subopt_struct(0x04, "string", profile["uri_path"]),
         _subopt_struct(0x05, "string", profile["subject_dn"]),

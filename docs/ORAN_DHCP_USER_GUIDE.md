@@ -1,8 +1,8 @@
 # O-RAN DHCP Tools — User Guide
 
-**Version:** 4.4.0
+**Version:** 4.5.0
 **Last Updated:** 2026-08-25
-**Packages Covered:** `oran-dhcp-gen` v2.7.0 · `dhcp-oru-toolkit` v2.1.2
+**Packages Covered:** `oran-dhcp-gen` v2.8.0 · `dhcp-oru-toolkit` v2.1.2
 
 > The lease viewer was renamed. `dhcp-lease-list` 1.3.0 became the
 > `dhcp-oru-toolkit` package at 2.0.0, which ships `dhcp-lease-list` and
@@ -462,6 +462,7 @@ Sub-option codes are the same for both families. Only the header differs: DHCPv4
 | Code | Field | Type | Source |
 |---|---|---|---|
 | `0x01` | CA server IP | address | `ca_ra_profile.ca_server_ipv4` / `ca_server_ipv6` |
+| `0x02` | CA server FQDN | string | `ca_ra_profile.ca_server_fqdn` — alternative or supplement to `0x01` |
 | `0x03` | CA port | uint16 | `class.ca_ra.port` — scalar, or per-family `{ipv4, ipv6}` |
 | `0x04` | URI path | string | `ca_ra_profile.uri_path` |
 | `0x05` | Subject DN | string | `ca_ra_profile.subject_dn` |
@@ -484,6 +485,19 @@ Adding `callhome_port` appends 0x87 to whichever chain the class emits — `…:
 
 **CA/RA form** — a `protocol: tls` class with a `ca_ra` block emits the full chain in code order: 0x01, 0x03, 0x04, 0x05, 0x06, then 0x81 (unless `include_controller_ip: false`), 0x82 (if `mplane_fqdn` set), 0x86, and 0x87 last (if `callhome_port` set).
 
+**Reaching the CA by name.** `ca_server_fqdn` emits sub-option `0x02` and serves both families from one value, so a profile can drop the per-family addresses entirely:
+
+```yaml
+ca_ra_profiles:
+  onefinity_ca:
+    ca_server_fqdn: "ca.mplane.local"     # sub-option 0x02, both families
+    uri_path:       "/pkix/"
+    subject_dn:     "/CN=1FinityLab Root CA/..."
+    app_protocol:   "http"
+```
+
+Setting both an address and a FQDN emits `0x01` then `0x02`. A profile must offer at least one of the three; and an address-only profile must carry the address family each referring class actually serves, or generation fails rather than emitting a CA/RA chain with no way to reach the CA.
+
 **Per-family CA/RA port.** `ca_ra.port` is normally one number used for both families:
 
 ```yaml
@@ -503,6 +517,28 @@ Some deployments front the same CMP endpoint on a different port per family. Giv
 ```
 
 Sub-option 0x03 then carries 8081 in `dhcpd.conf` / `kea-dhcp4.conf` and 8080 in `dhcpd6.conf` / `kea-dhcp6.conf`. If the mapping omits a family the class actually serves — an `ipv4_range` is present but no `ipv4` port — generation fails rather than falling back, because a silent fallback sends the wrong port to that family and the O-RU's CMP enrolment fails with a config that still validates.
+
+#### Sub-option coverage and its basis
+
+Every sub-option the generator emits, and what that mapping actually rests on. This matters because the wire bytes reach production radios, and "the spec says so" is only worth writing down when it is true.
+
+| Code | Meaning | Basis |
+|---|---|---|
+| `0x01` | CA/RA server IP | **Verified by working config.** Both labs emit it. Lab03 is decisive: its CA (`192.168.36.235`) and controller (`192.168.36.220`) are different hosts, in `0x01` and `0x81` respectively |
+| `0x02` | CA/RA server FQDN | **Inferred, not read from the spec.** It is the only gap in the `0x01`–`0x06` CA/RA run, and it mirrors `0x82` being the FQDN alternative to `0x81`. See the caveat below |
+| `0x03` | CA/RA port | **Verified.** Both labs; Lab01 varies it per family (v4 8081 / v6 8080) |
+| `0x04` | CA/RA URI path | **Verified.** `/pkix/` (Lab01), `/ejbca/publicweb/cmp/ATT_RU` (Lab03) |
+| `0x05` | CA/RA subject DN | **Verified.** Both labs |
+| `0x06` | CA/RA application protocol | **Verified.** Both labs (`http`) |
+| `0x81` | NETCONF controller IP | **Verified.** Both labs, and corroborated by the internal Kea/O-RAN reference notes |
+| `0x82` | Controller FQDN | **Verified.** Lab03 carries `00:82 … "mplane.local"` as the alternative to `0x81`, commented "Controller" |
+| `0x86` | Call-home mode | **Verified.** Both labs (`0x01` = TLS); corroborated as `0x00` = SSH / `0x01` = TLS |
+| `0x87` | Call-home port | **Verified.** Lab03 carries `87:02:10:ee` (4334); corroborated as "port, default 4334 = 0x10EE" |
+
+> **What this audit is not.** It is an audit against evidence — two labs' working configs and internal reference notes — not against the text of O-RAN.WG4.MP.0 clause 6.2.5, which could not be retrieved. Two consequences worth knowing:
+>
+> 1. **`0x02` is the one unverified mapping.** The structural argument is strong, but one public summary of an early specification revision describes the low codes as *O-RU Controller* IP and FQDN rather than CA/RA — which would contradict how both labs use `0x01`. That reading is inconsistent with Lab03's working split of CA and controller across `0x01` and `0x81`, so it most likely describes an earlier revision in which option 43 carried only controller information. Confirm `0x02` against your own copy of the spec before relying on it in production.
+> 2. **Coverage beyond these ten codes is unknown.** The spec may define sub-options neither lab uses. Nothing here claims the list is complete.
 
 Chains of three or more sub-options are emitted across multiple lines in the ISC configs, one sub-option per line. This is a readability change only — ISC `dhcpd` parses both forms identically and the wire bytes are the same:
 
@@ -1034,6 +1070,7 @@ sudo systemctl restart isc-dhcp-server
 
 | Version | Changes |
 |---------|---------|
+| 2.8.0 | **Sub-option `0x02` (CA/RA server FQDN)**, via `ca_ra_profile.ca_server_fqdn` — reaches the CA by name and serves both families from one value. A profile must now offer an address or a FQDN, and an address-only profile must cover every family its classes serve. Includes an audit of the emitter's sub-option coverage against the evidence available (see [Sub-option coverage and its basis](#sub-option-coverage-and-its-basis)) |
 | 2.7.0 | **`--explain`** prints what each class will actually receive — match prefix, pool range, and the option 43 / 17 chain decoded sub-option by sub-option, plus the flat hex — and writes nothing. Flags a `tls` class sending no 0x87 with the port the O-RU will fall back to. Built on the same resolved sub-options the emitters use, and checked against the generated configs by test, so it cannot drift from what is emitted |
 | 2.6.0 | **Top-level `defaults:` block** — every class inherits `controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra` and `options` unless it sets its own, so switching a lab between SSH and TLS is one edit rather than one per class. A class setting always wins; `ca_ra` merges one level deep and is not inherited into an `ssh` class. Also: a `protocol: tls` class with no `callhome_port` now warns — it is the exact case 0x87 exists to prevent, and both TLS classes in the Lab01 reference were silently in it |
 | 2.5.0 | **`ca_ra.port` accepts a per-family mapping** `{ipv4: N, ipv6: M}` for CAs reached on a different port per family; a scalar still means "both families". A mapping missing a family the class serves is rejected, not defaulted. Added `References/isc/Lab01` — a second lab's hand-written ISC configs plus the YAML that reproduces them — and a test that decodes both and requires the generated sub-option chains to match per class per family. Fixed the test helpers, which decoded a commented-out alternative chain when one sat above the live one |

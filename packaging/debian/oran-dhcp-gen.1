@@ -53,7 +53,10 @@ Named reusable lease parameter sets. Reference from a class via
 .TP
 .B ca_ra_profiles (optional, NEW in 2.2.0)
 Named reusable TLS CA/RA bootstrap settings (CA server IP, URI path,
-subject DN, app protocol, NETCONF mode byte). Reference from a class
+subject DN, app protocol). The CA is reached by address
+(\fIca_server_ipv4\fR/\fIca_server_ipv6\fR, sub-option 0x01) or by name
+(\fIca_server_fqdn\fR, sub-option 0x02, serving both families) or both; at
+least one is required. Reference from a class
 via \fIca_ra: { profile: <name>, port: N, ... }\fR.
 .IP
 \fIca_ra.port\fR is either a single number for both families or, since

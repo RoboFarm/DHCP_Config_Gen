@@ -999,6 +999,110 @@ def test_explain_covers_every_class_and_names_unserved_families():
 
 
 # ---------------------------------------------------------------------------
+# Sub-option 0x02 — CA/RA server FQDN
+# ---------------------------------------------------------------------------
+
+_CA_FQDN_MODEL = _TLS_MODEL.replace(
+    "lease_profiles:",
+    'ca_ra_profiles:\n'
+    '  ca:\n'
+    '    ca_server_ipv4: "192.168.36.235"\n'
+    '    ca_server_ipv6: "fd00:8b36:f2a9::24:eb"\n'
+    '    ca_server_fqdn: "ca.mplane.local"\n'
+    '    uri_path: "/pkix/"\n'
+    '    subject_dn: "/CN=Test"\n'
+    '    app_protocol: "http"\n'
+    'lease_profiles:').replace(
+    "    callhome_port: auto\n    lease_profile: bringup",
+    "    callhome_port: auto\n    lease_profile: bringup\n"
+    "    ca_ra:\n      profile: ca\n      port: 8080")
+
+
+def test_ca_ra_fqdn_emits_suboption_02_in_code_order():
+    """0x02 must sit between 0x01 and 0x03, in both backends.
+
+    An O-RU walks the chain in order; a sub-option out of sequence is a
+    different chain even when the same bytes are present.
+    """
+    tmp, files = _generate_model(_CA_FQDN_MODEL)
+    try:
+        for fname, decode in (("dhcpd.conf", isc_v4_suboptions),
+                              ("dhcpd6.conf", isc_v6_suboptions)):
+            subs = decode(isc_class_blocks(files[fname])["Tls4"])
+            codes = [c for c, _ in subs]
+            assert 0x02 in codes, "%s: no 0x02 for a profile with a FQDN" % fname
+            assert codes.index(0x01) < codes.index(0x02) < codes.index(0x03), \
+                "%s: chain out of code order: %s" % (fname, [hex(c) for c in codes])
+            assert dict(subs)[0x02] == b"ca.mplane.local", \
+                "%s: 0x02 carries %r" % (fname, dict(subs)[0x02])
+
+        for fname, root in (("kea-dhcp4.conf", "Dhcp4"),
+                            ("kea-dhcp6.conf", "Dhcp6")):
+            data = kea_vendor_data_by_class(json.loads(files[fname]), root)
+            assert data["Tls4"].get(0x02) == "ca.mplane.local", \
+                "%s: Kea carries %r for 0x02" % (fname, data["Tls4"].get(0x02))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ca_ra_fqdn_alone_serves_both_families():
+    """A profile with only a FQDN needs no per-family address at all."""
+    model = _CA_FQDN_MODEL.replace(
+        '    ca_server_ipv4: "192.168.36.235"\n'
+        '    ca_server_ipv6: "fd00:8b36:f2a9::24:eb"\n', '')
+    tmp, files = _generate_model(model)
+    try:
+        for fname, decode in (("dhcpd.conf", isc_v4_suboptions),
+                              ("dhcpd6.conf", isc_v6_suboptions)):
+            codes = [c for c, _ in decode(isc_class_blocks(files[fname])["Tls4"])]
+            assert 0x02 in codes and 0x01 not in codes, \
+                "%s: expected a FQDN-only CA chain, got %s" \
+                % (fname, [hex(c) for c in codes])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ca_ra_profile_must_offer_some_way_to_reach_the_ca():
+    tmp = tempfile.mkdtemp(prefix="oran-gen-noca-")
+    try:
+        bad = _write_yaml(tmp, _CA_FQDN_MODEL.replace(
+            '    ca_server_ipv4: "192.168.36.235"\n'
+            '    ca_server_ipv6: "fd00:8b36:f2a9::24:eb"\n'
+            '    ca_server_fqdn: "ca.mplane.local"\n', ''))
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(bad, out, "--no-timestamp")
+        assert proc.returncode != 0, \
+            "a ca_ra_profile with no IP and no FQDN must be rejected"
+        assert b"ca_server_fqdn" in proc.stdout
+        assert not os.listdir(out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_address_only_ca_profile_must_cover_every_served_family():
+    """An IPv4-only CA profile cannot serve a class that also serves IPv6.
+
+    Emitting a v6 chain whose CA/RA block carries no address at all is a
+    config that validates and cannot enrol.
+    """
+    tmp = tempfile.mkdtemp(prefix="oran-gen-cafam-")
+    try:
+        bad = _write_yaml(tmp, _CA_FQDN_MODEL
+                          .replace('    ca_server_fqdn: "ca.mplane.local"\n', '')
+                          .replace('    ca_server_ipv6: "fd00:8b36:f2a9::24:eb"\n', ''))
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        proc = generate(bad, out, "--no-timestamp")
+        assert proc.returncode != 0, \
+            "an ipv4-only CA profile must not silently serve an ipv6 class"
+        assert b"ipv6" in proc.stdout
+        assert not os.listdir(out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Validation: bad input must fail cleanly, never emit partial output
 # ---------------------------------------------------------------------------
 
