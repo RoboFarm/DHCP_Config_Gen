@@ -46,7 +46,13 @@
 # issuer certificate" at depth 1). The fix was one line in oru-cara.yaml --
 # chain: [subca, issuingca, root] instead of [subca, root] -- and was
 # confirmed the same day: the first "confirmed serial" ever logged by
-# orucara, 62 ms after issuance, and the 7-second loop stopped. The DN this
+# orucara, 62 ms after issuance, and the 7-second loop stopped. One
+# provisioning step then remained before call-home itself: TLS call-home is
+# MUTUAL -- the manager authenticates to the radio too, which validates it
+# against the operator CA received in caPubs -- and the O-RU manager had no
+# certificate of its own. With a cert/key provisioned to it, the radio
+# completed TLS call-home on 4335. The full path this file exists to enable
+# -- DHCP discovery, CMPv2 enrolment, TLS call-home -- works end to end. The DN this
 # model sends in 0x05 matches the delivered Root certificate's subject RDN
 # for RDN.
 #
