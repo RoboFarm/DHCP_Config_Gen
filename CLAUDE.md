@@ -17,6 +17,7 @@ tests/run_tests.py                    # test suite (works with or without pytest
 tests/golden/{lab4,example}/          # expected output for both reference inputs
 tests/update_goldens.sh               # regenerate goldens after an intended change
 docs/ORAN_DHCP_USER_GUIDE.md          # user guide
+docs/TLS_CALLHOME_FINDINGS.md         # findings/issues/resolutions record of the TLS bring-up (2.4.0-2.9.0)
 
 References/oran-dhcp-gen_2_2_3_all.deb   # the original v2.2.3 package, kept for reference
 References/isc/Lab03/                    # hand-written golden ISC configs from a real lab (pre-generator)
