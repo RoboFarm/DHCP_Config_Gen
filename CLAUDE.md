@@ -21,6 +21,7 @@ docs/ORAN_DHCP_USER_GUIDE.md          # user guide
 References/oran-dhcp-gen_2_2_3_all.deb   # the original v2.2.3 package, kept for reference
 References/isc/Lab03/                    # hand-written golden ISC configs from a real lab (pre-generator)
 References/kea/Lab4/                     # oran_dhcp.yaml + the kea-dhcp{4,6}.conf it generates
+References/srsllsc1/                     # option 17 captured off the wire where TLS call-home works
 ```
 
 Build output lands in `build/` and `dist/`; both are gitignored and disposable.
@@ -71,6 +72,15 @@ inputs, and additionally asserts three properties on the emitted files:
 Those three are the guard against a repeat of the 2.2.0–2.2.2 defect, which shipped three
 times because `kea-dhcp4 -t` validates schema and not wire bytes.
 
+`test_generator_reproduces_srsllsc1_observed_chain` is the only check in the suite independent
+of this repo: it compares the emitted DHCPv6 chain byte for byte against
+`References/srsllsc1/observed-dhcpv6-option17.txt`, a capture from a stack nobody here
+configured, taken in a run where the O-RU completed CMPv2 and reached TLS call-home. Every
+other test compares the generator to itself, to a hand-written config, or to a reading of the
+spec. If you change how any of `0x01`/`0x03`/`0x04`/`0x05`/`0x06`/`0x81`/`0x86` is encoded and
+that test still passes, the change is safe on the wire; if it fails, it is wrong regardless of
+what `kea-dhcp6 -t` says.
+
 `References/isc/Lab03/*` are hand-written and predate the generator — treat them as the
 semantic ISC target, not as byte-exact expected output.
 
@@ -87,7 +97,9 @@ tests/golden/` before committing.
 | `isc-dhcp-server` | `/etc/default/` |
 | `kea-dhcp4.conf`, `kea-dhcp6.conf` | `/etc/kea/` |
 
-Pipeline inside the script: `validate()` → range parsers → **TLV resolution** → five `gen_*()` emitters → optional deploy/restart.
+Pipeline inside the script: `validate()` → range parsers → **TLV resolution** → five `gen_*()` emitters → optional deploy/restart. `--explain` short-circuits after `validate()`: it renders the resolved sub-options and writes nothing.
+
+- `explain()` reads `resolve_suboptions()` / `resolve_tlv()`, the same values the emitters use, so the report cannot disagree with the generated configs. `test_explain_wire_matches_the_generated_config` decodes both and compares them per class per family — keep it that way rather than re-deriving bytes inside `explain()`.
 
 - `validate(cfg)` returns three name-keyed lookup dicts — `(controllers, lease_profiles, ca_ra_profiles)` — that every emitter threads through. All errors call `die()` (print + `sys.exit(1)`); the generator never emits partial output.
 - **Two parallel representations of the same O-RAN vendor options exist**, and this is the central design constraint:
@@ -100,8 +112,17 @@ Pipeline inside the script: `validate()` → range parsers → **TLV resolution*
 
 ## Domain rules that constrain edits
 
-- O-RU M-Plane discovery: DHCPv4 **option 43** and DHCPv6 **option 17** (O-RAN enterprise ID **53148**) carry the NETCONF controller address. Sub-options: `0x81` controller IP, `0x86` call-home mode (`01` = TLS, absent/`00` = SSH), `0x82` FQDN, and `0x01/0x03/0x04/0x05/0x06` for the CA/RA bootstrap chain. Call-home ports: SSH 4334, TLS 4335.
+- O-RU M-Plane discovery: DHCPv4 **option 43** and DHCPv6 **option 17** (O-RAN enterprise ID **53148**) carry the NETCONF controller address. Sub-options: `0x81` controller IP, `0x86` call-home mode (`01` = TLS, absent/`00` = SSH), `0x87` call-home port (uint16), `0x82` FQDN, and `0x01/0x03/0x04/0x05/0x06` for the CA/RA bootstrap chain. Call-home ports: SSH 4334, TLS 4335.
+- `0x87` is emitted only when a class sets `callhome_port` (an integer, or `auto` for the port matching `protocol`). Without it a `protocol: tls` class leaves the O-RU on its firmware default of 4334 and TLS call-home never completes — the lease looks healthy and both `dhcpd -t` and `kea-dhcp4 -t` pass, so it reads as an O-RU fault. Keeping it opt-in is what makes an upgrade byte-identical for models that do not set it; `test_callhome_port_is_opt_in` guards that.
+- Kea has no per-client-class `renew-timer`/`rebind-timer`, so a `lease_profile`'s T1/T2 go out as DHCPv4 options 58/59 in the class `option-data`, matching the ISC class block. DHCPv6 has no equivalent — T1/T2 are IA_NA fields there — so a v6 class carries lifetimes only.
 - `match_length` is **auto-derived** from `len(match_prefix)` — it is not a YAML field.
 - The catch-all class uses `match_prefix: ""` and **must be last**; ISC matches it via an empty substring, Kea via `not member(...)` of every other class.
+- **A dual-stack O-RU calls home over IPv6.** When a class serves both families the O-RU takes an address on each, and the IPv6 chain is the one that governs call-home — so `option 17` is the operative payload and `option 43` is not what the radio acts on. Consequences: for such a class the IPv6 CA address, IPv6 controller and the v6 `ca_ra.port` are the values that matter; a per-family `ca_ra.port` mapping is decided by its `ipv6` entry; and verifying only a DHCPv4 capture proves nothing about the path in use. Capture DHCPv6 (`port 546 or 547`) when confirming a dual-stack deployment.
 - Ranges use hyphens, not tildes: `192.168.44.160-169`, `fd00:8b36:f2a9::160-169`.
-- A `ca_ra` block on a class only takes effect when `protocol: tls`.
+- **A deployment may serve one family only** (2.9.0). `subnets` needs at least one of `ipv4`/`ipv6`, a controller needs an address only for the families its classes serve, and the unserved family's files are not written — `_emit()` in the driver skips them and `gen_isc_defaults` emits an empty `INTERFACESv4`/`INTERFACESv6`. Two `die()`s keep the hole closed: a class serving a family its controller has no address for (the chain would carry no `0x81`), and a class with a range in a family that has no subnet (it would be silently dropped). All four reference inputs are dual-stack, so this changed no existing output.
+- A `ca_ra` block on a class only takes effect when `protocol: tls`. A top-level `defaults:` block supplies any per-class key (`controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra`, `options`) to classes that do not set it — merged in `apply_class_defaults()` before `validate()`, so every downstream check sees the effective class. A class key always wins; `ca_ra` merges one level deep; `ca_ra` is not inherited into an `ssh` class (it would warn about an ignored block); `defaults:` rejects `name`/`match_prefix`/the ranges.
+- `protocol: tls` with no `callhome_port` warns rather than dies — firmware that already defaults to 4335 is fine and refusing would break working configs. Both Lab01 TLS classes are in that state, so the reference input warns by design; `test_tls_without_callhome_port_warns` pins it.
+- A `ca_ra_profile` reaches the CA by address (`ca_server_ipv4`/`ca_server_ipv6`, sub-option `0x01`) or by name (`ca_server_fqdn`, sub-option `0x02`, both families) or both; at least one is required, and an address-only profile must cover every family its classes serve. **`0x02` is the one sub-option mapping with no observed example anywhere** — not in either lab's configs, not in the srsllsc1 capture — it is inferred from the gap in the `0x01`–`0x06` run and from `0x82` being the named alternative to `0x81`. The audit table and its caveat live in the user guide under "Sub-option coverage and its basis"; do not restate it as spec-confirmed.
+- `ca_ra.port` is either a scalar (both families) or `{ipv4: N, ipv6: M}`. Lab01 fronts one CMP endpoint on a different port per family, so a scalar there would put the v4 port into the v6 chain. A mapping missing a family the class serves is a `die()`, never a fallback.
+- `References/kea/Lab4/oran_dhcp-tls.yaml` is the Lab4 model with TLS enabled — a separate file because `oran_dhcp.yaml` records what that lab runs today (SSH) and is a golden input. Its `ca_server_ipv4` is a marked placeholder: the `tls_ca:` block it was recovered from carried only an IPv6 CA. Its catch-all opts out of `ca_ra` and `callhome_port` so an unrecognised O-RU is never pointed at a CA; `test_lab4_tls_model_turns_tls_on_without_touching_the_catch_all` pins that.
+- `References/isc/Lab01/` pairs a second lab's hand-written ISC configs with the `oran_dhcp.yaml` that reproduces them; `test_generator_reproduces_lab01_vendor_chains` decodes both and compares sub-option chains per class per family. Like Lab03 these are the semantic target, not byte-exact output. Note both labs keep a commented-out alternative chain directly above the live one — decode helpers must anchor at line start or they read the comment.

@@ -42,6 +42,7 @@ Changelog:
 
 import sys
 import re
+import copy
 import json
 import ipaddress
 import argparse
@@ -54,7 +55,7 @@ except ImportError:
     print("[ERROR] PyYAML not installed. Run: pip install pyyaml")
     sys.exit(1)
 
-__version__ = "2.3.0"
+__version__ = "2.9.0"
 
 # Set to False by --no-timestamp.  Generated configs normally carry the time
 # they were produced, which is useful in /etc but makes byte-diffing against a
@@ -77,9 +78,34 @@ def generated_by():
 # ---------------------------------------------------------------------------
 
 REQUIRED_GLOBAL = ["default_lease_time", "max_lease_time", "oran_enterprise_id"]
-REQUIRED_CTRL   = ["name", "ipv4", "ipv6"]
+REQUIRED_CTRL   = ["name"]        # ipv4/ipv6 are per-family, see validate()
 REQUIRED_CLASS  = ["name", "match_prefix", "controller", "protocol"]
 VALID_PROTOCOLS = ["ssh", "tls"]
+
+# IANA-registered NETCONF call-home ports (RFC 8071).  An O-RU that is told
+# "use TLS" (sub-option 0x86 = 0x01) but is not told a port falls back to its
+# firmware default, which on the Fujitsu units in the lab is 4334 -- the SSH
+# call-home port.  The TLS listener never sees the connection.  Sub-option
+# 0x87 carries the port explicitly; `callhome_port: auto` picks from here.
+CALLHOME_PORTS = {"ssh": 4334, "tls": 4335}
+
+# Keys the model understands.  Anything else is a typo or a schema that was
+# imagined but never implemented -- `tls_ca:` under a controller is the known
+# example, see validate().  Unknown keys are reported, never silently dropped.
+KNOWN_CTRL_KEYS  = {"name", "description", "ipv4", "ipv6"}
+KNOWN_CLASS_KEYS = {"name", "description", "match_prefix", "controller",
+                    "protocol", "callhome_port", "lease_profile",
+                    "ipv4_range", "ipv6_range", "ca_ra", "options"}
+KNOWN_CA_RA_KEYS = {"profile", "port", "mplane_fqdn", "include_controller_ip"}
+
+# Keys a top-level `defaults:` block may set for every class.  Deliberately
+# excludes name, match_prefix and the ranges: those are what makes a class a
+# class, and inheriting them would be meaningless.  The point of the block is
+# that switching a whole lab between SSH and TLS is one edit rather than one
+# edit per class -- the previous shape had operators changing `protocol` in
+# every class and, in practice, missing one.
+DEFAULTABLE_CLASS_KEYS = {"controller", "protocol", "callhome_port",
+                          "lease_profile", "ca_ra", "options"}
 
 
 def die(msg):
@@ -89,6 +115,64 @@ def die(msg):
 
 def warn(msg):
     print(f"[WARN] {msg}")
+
+
+def check_address(value, family, where):
+    """Parse an address from the model, or die naming where it came from.
+
+    Without this a typo or a leftover placeholder reaches ipaddress inside a
+    TLV builder and comes out as a raw AddressValueError traceback, which
+    tells an operator nothing about which field to fix.
+    """
+    cls_ = ipaddress.IPv4Address if family == "ipv4" else ipaddress.IPv6Address
+    try:
+        return cls_(value)
+    except (ipaddress.AddressValueError, ValueError) as e:
+        die(f"{where}: '{value}' is not a valid {family} address ({e})")
+
+
+def apply_class_defaults(cfg):
+    """Fill each oru_class from the top-level `defaults:` block, in place.
+
+    A key set on the class always wins.  Presence is what counts, not truth:
+    `ca_ra:` with no value on a class means "no CA/RA chain here" and overrides
+    an inherited one, which is how a single SSH class opts out of a TLS-by-
+    default lab.
+
+    `ca_ra` merges one level deep, so a class that only needs its own port says
+
+        ca_ra:
+          port: {ipv4: 8081, ipv6: 8080}
+
+    and keeps the inherited profile.  Nothing else merges -- scalars replace.
+    """
+    defaults = cfg.get("defaults")
+    if not defaults:
+        return
+
+    unknown = set(defaults) - DEFAULTABLE_CLASS_KEYS
+    if unknown:
+        die(f"defaults: cannot set {', '.join(sorted(unknown))} — a default "
+            f"only makes sense for a per-class setting. Allowed: "
+            f"{', '.join(sorted(DEFAULTABLE_CLASS_KEYS))}")
+
+    for cls in cfg.get("oru_classes", []):
+        for key, value in defaults.items():
+            if key not in cls:
+                # A CA/RA block is meaningless on an SSH class -- inheriting one
+                # into every SSH class of a TLS-by-default lab would emit a
+                # "ca_ra will be ignored" warning nobody asked for. Read the
+                # protocol from defaults directly so this does not depend on
+                # the order of keys in the block.
+                if key == "ca_ra" and \
+                        cls.get("protocol", defaults.get("protocol")) != "tls":
+                    continue
+                cls[key] = copy.deepcopy(value)
+            elif (key == "ca_ra"
+                  and isinstance(cls[key], dict) and isinstance(value, dict)):
+                merged = copy.deepcopy(value)
+                merged.update(cls[key])
+                cls[key] = merged
 
 
 def validate(cfg):
@@ -101,12 +185,41 @@ def validate(cfg):
         if f not in cfg.get("global", {}):
             die(f"global.{f} is required")
 
+    # Classes are validated in their effective form -- after defaults are
+    # folded in -- so every check below sees what will actually be emitted.
+    apply_class_defaults(cfg)
+
     # --- controllers ---
     controllers = {}
     for c in cfg.get("controllers", []):
         for f in REQUIRED_CTRL:
             if f not in c:
                 die(f"Controller missing required field: '{f}'")
+        # 'tls_ca' was never a real field.  A commented-out block using it
+        # shipped in the Lab4 reference YAML, so uncommenting it looked like
+        # the way to turn on TLS bootstrap -- and produced a config with no
+        # CA/RA sub-options at all and no complaint.  Fail loudly instead.
+        if "tls_ca" in c:
+            die(f"Controller '{c['name']}' uses 'tls_ca', which this generator "
+                f"has never implemented. TLS CA/RA bootstrap is configured with "
+                f"a top-level 'ca_ra_profiles' entry referenced from a class via "
+                f"'ca_ra: {{ profile: <name>, port: N }}' — see the user guide.")
+        # A controller may be single-family.  srsllsc1 runs an IPv6-only
+        # M-plane -- and since a dual-stack O-RU calls home over IPv6 anyway,
+        # requiring an IPv4 address there would mean inventing one.  Which
+        # families a controller must cover is decided per class below, from
+        # the ranges that class actually serves.
+        if "ipv4" not in c and "ipv6" not in c:
+            die(f"Controller '{c['name']}' defines neither ipv4 nor ipv6 — "
+                f"it needs at least one address for an O-RU to call home to")
+        if "ipv4" in c:
+            check_address(c["ipv4"], "ipv4", f"controller '{c['name']}' ipv4")
+        if "ipv6" in c:
+            check_address(c["ipv6"], "ipv6", f"controller '{c['name']}' ipv6")
+        for k in c:
+            if k not in KNOWN_CTRL_KEYS:
+                warn(f"Controller '{c['name']}': unknown field '{k}' — ignored. "
+                     f"Known fields: {', '.join(sorted(KNOWN_CTRL_KEYS))}")
         controllers[c["name"]] = c
     if not controllers:
         die("At least one controller must be defined")
@@ -124,9 +237,14 @@ def validate(cfg):
             die(f"ca_ra_profile '{name}' is empty")
         # Required for either family that's used:
         # ca_server_ipv4 OR ca_server_ipv6 must be present
-        if "ca_server_ipv4" not in prof and "ca_server_ipv6" not in prof:
+        if not any(k in prof for k in
+                   ("ca_server_ipv4", "ca_server_ipv6", "ca_server_fqdn")):
             die(f"ca_ra_profile '{name}' must define at least one of "
-                f"ca_server_ipv4 or ca_server_ipv6")
+                f"ca_server_ipv4, ca_server_ipv6 or ca_server_fqdn — the O-RU "
+                f"needs some way to reach the CA/RA server")
+        for key, fam in (("ca_server_ipv4", "ipv4"), ("ca_server_ipv6", "ipv6")):
+            if key in prof:
+                check_address(prof[key], fam, f"ca_ra_profile '{name}' {key}")
         for f in ("uri_path", "subject_dn", "app_protocol"):
             if f not in prof:
                 die(f"ca_ra_profile '{name}' missing required field: '{f}'")
@@ -144,10 +262,12 @@ def validate(cfg):
     # --- subnets ---
     if "subnets" not in cfg:
         die("subnets section is required")
-    if not cfg["subnets"].get("ipv4"):
-        die("subnets.ipv4 is required")
-    if not cfg["subnets"].get("ipv6"):
-        die("subnets.ipv6 is required")
+    # One family is enough.  An IPv6-only M-plane is a real deployment --
+    # srsllsc1 runs one -- and since a dual-stack O-RU calls home over IPv6,
+    # demanding an IPv4 subnet there would mean inventing a network.  The
+    # files for an unserved family are not written at all.
+    if not cfg["subnets"].get("ipv4") and not cfg["subnets"].get("ipv6"):
+        die("subnets must define at least one of 'ipv4' or 'ipv6'")
 
     # --- oru_classes ---
     classes = cfg.get("oru_classes", [])
@@ -158,7 +278,11 @@ def validate(cfg):
     for cls in classes:
         for f in REQUIRED_CLASS:
             if f not in cls:
-                die(f"oru_class '{cls.get('name','?')}' missing required field: '{f}'")
+                die(f"oru_class '{cls.get('name','?')}' missing required field: "
+                    f"'{f}'"
+                    + (f" — set it on the class, or once for every class in a "
+                       f"top-level 'defaults:' block"
+                       if f in DEFAULTABLE_CLASS_KEYS else ""))
         name = cls["name"]
         if name in names_seen:
             die(f"Duplicate oru_class name: '{name}'")
@@ -168,6 +292,46 @@ def validate(cfg):
         if cls["protocol"] not in VALID_PROTOCOLS:
             die(f"oru_class '{name}' protocol must be 'ssh' or 'tls', got: '{cls['protocol']}'")
 
+        for k in cls:
+            if k not in KNOWN_CLASS_KEYS:
+                warn(f"oru_class '{name}': unknown field '{k}' — ignored. "
+                     f"Known fields: {', '.join(sorted(KNOWN_CLASS_KEYS))}")
+
+        # callhome_port: int, or "auto" to take the RFC 8071 port for the
+        # class protocol.  Absent means sub-option 0x87 is not emitted at all,
+        # which is the pre-2.4.0 wire format.
+        cp = cls.get("callhome_port")
+        if cp is not None:
+            if isinstance(cp, str):
+                if cp != "auto":
+                    die(f"oru_class '{name}' callhome_port must be an integer "
+                        f"1-65535 or 'auto', got: '{cp}'")
+            elif isinstance(cp, bool) or not isinstance(cp, int):
+                die(f"oru_class '{name}' callhome_port must be an integer "
+                    f"1-65535 or 'auto', got: {cp!r}")
+            elif not 1 <= cp <= 65535:
+                die(f"oru_class '{name}' callhome_port out of range: {cp} "
+                    f"(must be 1-65535)")
+            elif cls["protocol"] == "tls" and cp == CALLHOME_PORTS["ssh"]:
+                warn(f"oru_class '{name}' is protocol: tls but sets "
+                     f"callhome_port: {cp}, the SSH call-home port. The O-RU "
+                     f"will open a TLS connection to the SSH listener. "
+                     f"Use {CALLHOME_PORTS['tls']} or 'auto' unless this is "
+                     f"deliberate.")
+        elif cls["protocol"] == "tls":
+            # The failure this whole sub-option exists to prevent, and the one
+            # that reads as an O-RU fault: 0x86 says TLS, nothing says which
+            # port, so the O-RU uses its firmware default -- 4334, the SSH
+            # port, on the Fujitsu units. Not fatal: firmware that already
+            # defaults to 4335 is fine, and refusing would break configs that
+            # work today.
+            warn(f"oru_class '{name}' is protocol: tls but sets no "
+                 f"callhome_port, so no sub-option 0x87 is sent and the O-RU "
+                 f"falls back to its firmware default — 4334, the SSH "
+                 f"call-home port, on the Fujitsu units. TLS call-home then "
+                 f"never completes and the lease still looks healthy. "
+                 f"Add 'callhome_port: auto' to send {CALLHOME_PORTS['tls']}.")
+
         # New: ranges are now optional (presence enables that family)
         if "ipv4_range" not in cls and "ipv6_range" not in cls:
             die(f"oru_class '{name}' must have at least one of ipv4_range or ipv6_range")
@@ -175,6 +339,23 @@ def validate(cfg):
             parse_ipv4_range(cls["ipv4_range"], name)
         if "ipv6_range" in cls:
             parse_ipv6_range(cls["ipv6_range"], name)
+
+        # The controller has to carry an address for every family the class
+        # serves; otherwise that family's chain would have no 0x81 at all and
+        # the O-RU would take a lease and never learn where to call home.
+        ctrl = controllers[cls["controller"]]
+        for fam, range_key in (("ipv4", "ipv4_range"), ("ipv6", "ipv6_range")):
+            if range_key in cls and fam not in ctrl:
+                die(f"oru_class '{name}' serves {fam} (has {range_key}) but "
+                    f"controller '{cls['controller']}' defines no {fam} "
+                    f"address — the {fam} chain would carry no controller IP")
+            # Without the subnet that family's file is never written, so the
+            # range would be silently dropped rather than served.
+            if range_key in cls and not cfg["subnets"].get(fam):
+                die(f"oru_class '{name}' has {range_key} but no {fam} subnet "
+                    f"is defined, so no {fam} config is generated and the "
+                    f"range would never be served. Add subnets.{fam}, or drop "
+                    f"{range_key} from the class.")
 
         # New: lease_profile reference
         lp = cls.get("lease_profile")
@@ -191,8 +372,59 @@ def validate(cfg):
                 die(f"oru_class '{name}' ca_ra block missing required field: 'profile'")
             if ca_ra["profile"] not in ca_ra_profiles:
                 die(f"oru_class '{name}' ca_ra references undefined profile: '{ca_ra['profile']}'")
+            # A profile carrying only an FQDN serves both families. One
+            # carrying only addresses must carry the address family this
+            # class actually serves, or the O-RU is handed a chain with no
+            # way to reach the CA.
+            prof = ca_ra_profiles[ca_ra["profile"]]
+            if not prof.get("ca_server_fqdn"):
+                for fam, range_key, ip_key in (
+                    ("ipv4", "ipv4_range", "ca_server_ipv4"),
+                    ("ipv6", "ipv6_range", "ca_server_ipv6"),
+                ):
+                    if range_key in cls and ip_key not in prof:
+                        die(f"oru_class '{name}' serves {fam} and uses ca_ra "
+                            f"profile '{ca_ra['profile']}', which defines "
+                            f"neither {ip_key} nor ca_server_fqdn — the {fam} "
+                            f"chain would carry no CA/RA address")
             if "port" not in ca_ra:
                 die(f"oru_class '{name}' ca_ra block missing required field: 'port'")
+
+            # port: a scalar for both families, or {ipv4: N, ipv6: M}. The
+            # mapping form exists because a CA can front the same CMP endpoint
+            # on a different port per family; a scalar would quietly send the
+            # v4 port to v6 clients.
+            def _check_port(value, where):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    die(f"oru_class '{name}' {where} must be an integer "
+                        f"1-65535, got: {value!r}")
+                if not 1 <= value <= 65535:
+                    die(f"oru_class '{name}' {where} out of range: {value} "
+                        f"(must be 1-65535)")
+
+            port = ca_ra["port"]
+            if isinstance(port, dict):
+                unknown = set(port) - {"ipv4", "ipv6"}
+                if unknown:
+                    die(f"oru_class '{name}' ca_ra.port has unknown key(s): "
+                        f"{', '.join(sorted(unknown))} — expected 'ipv4' and/or "
+                        f"'ipv6'")
+                if not port:
+                    die(f"oru_class '{name}' ca_ra.port mapping is empty")
+                for fam, range_key in (("ipv4", "ipv4_range"), ("ipv6", "ipv6_range")):
+                    if range_key in cls and fam not in port:
+                        die(f"oru_class '{name}' serves {fam} (has {range_key}) "
+                            f"but ca_ra.port defines no '{fam}' port. Add it, or "
+                            f"use a single scalar port for both families.")
+                    if fam in port:
+                        _check_port(port[fam], f"ca_ra.port.{fam}")
+            else:
+                _check_port(port, "ca_ra.port")
+            for k in ca_ra:
+                if k not in KNOWN_CA_RA_KEYS:
+                    warn(f"oru_class '{name}' ca_ra: unknown field '{k}' — "
+                         f"ignored. Known fields: "
+                         f"{', '.join(sorted(KNOWN_CA_RA_KEYS))}")
 
     print(f"[OK] Validation passed — {len(classes)} O-RU classes, "
           f"{len(controllers)} controllers, "
@@ -265,19 +497,40 @@ def group_classes_by_range(classes, family):
 # format multi-line for ISC.
 # ---------------------------------------------------------------------------
 
-def build_option43_chunks_simple(ctrl_ipv4, protocol):
+def resolve_callhome_port(cls):
+    """Port for sub-option 0x87, or None when the class does not set one.
+
+    `callhome_port: auto` resolves to the RFC 8071 port for the class
+    protocol (SSH 4334, TLS 4335).  Omitting the field emits no 0x87, which
+    keeps the chain byte-identical to pre-2.4.0 output.
+    """
+    cp = cls.get("callhome_port")
+    if cp is None:
+        return None
+    if cp == "auto":
+        return CALLHOME_PORTS[cls["protocol"]]
+    return int(cp)
+
+
+def build_option43_chunks_simple(ctrl_ipv4, protocol, callhome_port=None):
     """DHCPv4 simple form — chunks per sub-option."""
     chunks = [bytes([0x81, 0x04]) + ipaddress.IPv4Address(ctrl_ipv4).packed]
     if protocol == "tls":
         chunks.append(bytes([0x86, 0x01, 0x01]))
+    if callhome_port is not None:
+        chunks.append(bytes([0x87, 0x02,
+                             (callhome_port >> 8) & 0xFF, callhome_port & 0xFF]))
     return chunks
 
 
-def build_option17_chunks_simple(ctrl_ipv6, protocol):
+def build_option17_chunks_simple(ctrl_ipv6, protocol, callhome_port=None):
     """DHCPv6 simple form — chunks per sub-option."""
     chunks = [bytes([0x00, 0x81, 0x00, 0x10]) + ipaddress.IPv6Address(ctrl_ipv6).packed]
     if protocol == "tls":
         chunks.append(bytes([0x00, 0x86, 0x00, 0x01, 0x01]))
+    if callhome_port is not None:
+        chunks.append(bytes([0x00, 0x87, 0x00, 0x02,
+                             (callhome_port >> 8) & 0xFF, callhome_port & 0xFF]))
     return chunks
 
 
@@ -292,6 +545,7 @@ def build_option17_chunks_simple(ctrl_ipv6, protocol):
 # Code  IPv4 hdr   IPv6 hdr   Field                 Source
 # ----  ---------  ---------  --------------------  -----------------------
 # 0x01  01:LL      00:01:LL   CA server IP          ca_ra_profile
+# 0x02  02:LL      00:02:LL   CA server FQDN (str)  ca_ra_profile (optional)
 # 0x03  03:LL      00:03:LL   CA port (uint16 BE)   class.ca_ra.port
 # 0x04  04:LL      00:04:LL   URI path (string)     ca_ra_profile
 # 0x05  05:LL      00:05:LL   Subject DN (string)   ca_ra_profile
@@ -299,7 +553,23 @@ def build_option17_chunks_simple(ctrl_ipv6, protocol):
 # 0x81  81:LL      00:81:LL   Controller IP         class.controller (opt-in)
 # 0x82  82:LL      00:82:LL   M-plane FQDN (str)    class.ca_ra.mplane_fqdn
 # 0x86  86:LL      00:86:LL   NETCONF mode (uint8)  ca_ra_profile (default 0x00)
+# 0x87  87:LL      00:87:LL   Call-home port (u16)  class.callhome_port (opt-in)
 # ---------------------------------------------------------------------------
+
+
+def resolve_ca_ra_port(ca_ra_class, family):
+    """CA/RA server port (sub-option 0x03) for this family.
+
+    `port` is either a scalar -- one port for both families, the only form
+    before 2.5.0 -- or a mapping {ipv4: N, ipv6: M}.  Lab01 reaches the same
+    CMP endpoint on a different port per family (TDDn77 v4 8081 / v6 8080),
+    which a scalar cannot express: it would silently send the v4 port to v6
+    clients.  validate() has already checked shape and range.
+    """
+    port = ca_ra_class["port"]
+    if isinstance(port, dict):
+        return int(port[family])
+    return int(port)
 
 
 def _v4_subopt(code, value_bytes):
@@ -317,7 +587,8 @@ def _v6_subopt(code, value_bytes):
     ]) + value_bytes
 
 
-def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol):
+def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol,
+                       callhome_port=None):
     """
     Build the full ATT-style vendor sub-option chain as a list of
     per-sub-option byte chunks (one bytes object per sub-option).
@@ -331,25 +602,28 @@ def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol):
                      per O-RAN WG4 §6.2.5 (0x00=SSH, 0x01=TLS).
                      Profile-level 'netconf_mode_byte' overrides if set
                      (deprecated escape hatch).
+      callhome_port: NETCONF call-home port for sub-opt 0x87, or None to
+                     omit it (see resolve_callhome_port).
     """
     is_v4 = (family == "ipv4")
     subopt = _v4_subopt if is_v4 else _v6_subopt
     chunks = []
 
-    # 0x01: CA server IP (always present)
-    if is_v4:
-        ca_ip = profile.get("ca_server_ipv4")
-        if ca_ip is None:
-            die(f"ca_ra_profile must define ca_server_ipv4 to emit IPv4 sub-options")
-        chunks.append(subopt(0x01, ipaddress.IPv4Address(ca_ip).packed))
-    else:
-        ca_ip = profile.get("ca_server_ipv6")
-        if ca_ip is None:
-            die(f"ca_ra_profile must define ca_server_ipv6 to emit IPv6 sub-options")
-        chunks.append(subopt(0x01, ipaddress.IPv6Address(ca_ip).packed))
+    # 0x01: CA server IP, 0x02: CA server FQDN. The O-RU needs at least one
+    # way to reach the CA; validate() has already checked that this profile
+    # gives it one for this family.
+    ip_key = "ca_server_ipv4" if is_v4 else "ca_server_ipv6"
+    ca_ip  = profile.get(ip_key)
+    if ca_ip is not None:
+        packed = (ipaddress.IPv4Address(ca_ip).packed if is_v4
+                  else ipaddress.IPv6Address(ca_ip).packed)
+        chunks.append(subopt(0x01, packed))
+    ca_fqdn = profile.get("ca_server_fqdn")
+    if ca_fqdn:
+        chunks.append(subopt(0x02, ca_fqdn.encode("ascii")))
 
-    # 0x03: CA port
-    port = int(ca_ra_class["port"])
+    # 0x03: CA port (per-family since 2.5.0)
+    port = resolve_ca_ra_port(ca_ra_class, family)
     chunks.append(subopt(0x03, bytes([(port >> 8) & 0xFF, port & 0xFF])))
 
     # 0x04: URI path
@@ -381,6 +655,11 @@ def build_ca_ra_chunks(family, profile, ca_ra_class, controller, protocol):
         mode_byte = 0x01 if protocol == "tls" else 0x00
     chunks.append(subopt(0x86, bytes([mode_byte])))
 
+    # 0x87: NETCONF call-home port (optional, opt-in via class.callhome_port)
+    if callhome_port is not None:
+        chunks.append(subopt(0x87, bytes([(callhome_port >> 8) & 0xFF,
+                                          callhome_port & 0xFF])))
+
     return chunks
 
 
@@ -406,16 +685,17 @@ def resolve_tlv(family, cls, controllers, ca_ra_profiles):
     ctrl     = controllers[cls["controller"]]
     protocol = cls["protocol"]
     ca_ra    = cls.get("ca_ra")
+    port     = resolve_callhome_port(cls)
 
     if ca_ra is not None and protocol == "tls":
         profile = ca_ra_profiles[ca_ra["profile"]]
-        chunks = build_ca_ra_chunks(family, profile, ca_ra, ctrl, protocol)
+        chunks = build_ca_ra_chunks(family, profile, ca_ra, ctrl, protocol, port)
     else:
         # Simple legacy form (v2.1.x compatible)
         if family == "ipv4":
-            chunks = build_option43_chunks_simple(ctrl["ipv4"], protocol)
+            chunks = build_option43_chunks_simple(ctrl["ipv4"], protocol, port)
         else:
-            chunks = build_option17_chunks_simple(ctrl["ipv6"], protocol)
+            chunks = build_option17_chunks_simple(ctrl["ipv6"], protocol, port)
 
     raw = b"".join(chunks)
     return chunks, bytes_to_hex_str(raw), raw
@@ -437,6 +717,7 @@ def resolve_tlv(family, cls, controllers, ca_ra_profiles):
 # code -> (kea option name, {family: kea type})
 KEA_SUBOPT_DEFS = {
     0x01: ("oran-ca-server-ip",      {"ipv4": "ipv4-address", "ipv6": "ipv6-address"}),
+    0x02: ("oran-ca-server-fqdn",    {"ipv4": "string",       "ipv6": "string"}),
     0x03: ("oran-ca-port",           {"ipv4": "uint16",       "ipv6": "uint16"}),
     0x04: ("oran-ca-uri-path",       {"ipv4": "string",       "ipv6": "string"}),
     0x05: ("oran-ca-subject-dn",     {"ipv4": "string",       "ipv6": "string"}),
@@ -444,6 +725,24 @@ KEA_SUBOPT_DEFS = {
     0x81: ("oran-netconf-server-ip", {"ipv4": "ipv4-address", "ipv6": "ipv6-address"}),
     0x82: ("oran-mplane-fqdn",       {"ipv4": "string",       "ipv6": "string"}),
     0x86: ("oran-netconf-mode",      {"ipv4": "uint8",        "ipv6": "uint8"}),
+    0x87: ("oran-netconf-callhome-port",
+                                     {"ipv4": "uint16",       "ipv6": "uint16"}),
+}
+
+
+# Human labels for --explain.  Kept beside KEA_SUBOPT_DEFS so a new
+# sub-option is obvious if it lands in one table and not the other.
+SUBOPT_LABELS = {
+    0x01: "CA/RA server IP",
+    0x02: "CA/RA server FQDN",
+    0x03: "CA/RA port",
+    0x04: "CA/RA URI path",
+    0x05: "CA/RA subject DN",
+    0x06: "CA/RA protocol",
+    0x81: "Controller IP",
+    0x82: "M-plane FQDN",
+    0x86: "Call-home mode",
+    0x87: "Call-home port",
 }
 
 
@@ -451,30 +750,35 @@ def _subopt_struct(code, kea_type, kea_data):
     return {"code": code, "type": kea_type, "data": kea_data}
 
 
-def build_subopts_simple(family, ctrl, protocol):
+def build_subopts_simple(family, ctrl, protocol, callhome_port=None):
     """Structured simple form — mirrors build_option43/17_chunks_simple."""
     ip_type = "ipv4-address" if family == "ipv4" else "ipv6-address"
     ip_key  = "ipv4" if family == "ipv4" else "ipv6"
     subs = [_subopt_struct(0x81, ip_type, ctrl[ip_key])]
     if protocol == "tls":
         subs.append(_subopt_struct(0x86, "uint8", "1"))
+    if callhome_port is not None:
+        subs.append(_subopt_struct(0x87, "uint16", str(callhome_port)))
     return subs
 
 
-def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol):
+def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol,
+                        callhome_port=None):
     """Structured full ATT-style CA/RA form — mirrors build_ca_ra_chunks."""
     is_v4   = (family == "ipv4")
     ip_type = "ipv4-address" if is_v4 else "ipv6-address"
     ip_key  = "ipv4" if is_v4 else "ipv6"
     ca_key  = "ca_server_ipv4" if is_v4 else "ca_server_ipv6"
 
+    subs = []
     ca_ip = profile.get(ca_key)
-    if ca_ip is None:
-        die(f"ca_ra_profile must define {ca_key} to emit {family} sub-options")
-
-    subs = [
-        _subopt_struct(0x01, ip_type, ca_ip),
-        _subopt_struct(0x03, "uint16", str(int(ca_ra_class["port"]))),
+    if ca_ip is not None:
+        subs.append(_subopt_struct(0x01, ip_type, ca_ip))
+    ca_fqdn = profile.get("ca_server_fqdn")
+    if ca_fqdn:
+        subs.append(_subopt_struct(0x02, "string", ca_fqdn))
+    subs += [
+        _subopt_struct(0x03, "uint16", str(resolve_ca_ra_port(ca_ra_class, family))),
         _subopt_struct(0x04, "string", profile["uri_path"]),
         _subopt_struct(0x05, "string", profile["subject_dn"]),
         _subopt_struct(0x06, "string", profile["app_protocol"]),
@@ -489,6 +793,8 @@ def build_subopts_ca_ra(family, profile, ca_ra_class, controller, protocol):
     else:
         mode_byte = 0x01 if protocol == "tls" else 0x00
     subs.append(_subopt_struct(0x86, "uint8", str(mode_byte)))
+    if callhome_port is not None:
+        subs.append(_subopt_struct(0x87, "uint16", str(callhome_port)))
     return subs
 
 
@@ -526,12 +832,13 @@ def resolve_suboptions(family, cls, controllers, ca_ra_profiles):
     ctrl     = controllers[cls["controller"]]
     protocol = cls["protocol"]
     ca_ra    = cls.get("ca_ra")
+    port     = resolve_callhome_port(cls)
 
     if ca_ra is not None and protocol == "tls":
         profile = ca_ra_profiles[ca_ra["profile"]]
-        subs = build_subopts_ca_ra(family, profile, ca_ra, ctrl, protocol)
+        subs = build_subopts_ca_ra(family, profile, ca_ra, ctrl, protocol, port)
     else:
-        subs = build_subopts_simple(family, ctrl, protocol)
+        subs = build_subopts_simple(family, ctrl, protocol, port)
 
     # Cross-check against the ISC byte builders (single source of truth guard)
     subopt_enc = _v4_subopt if family == "ipv4" else _v6_subopt
@@ -836,13 +1143,15 @@ def gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles):
 
 
 def gen_isc_defaults(cfg):
+    # A family with no subnet gets an empty INTERFACES line, which is how the
+    # init script is told not to start that daemon.
     v4_ifaces = list(dict.fromkeys(
-        s["interface"] for s in cfg["subnets"]["ipv4"] if "interface" in s))
+        s["interface"] for s in cfg["subnets"].get("ipv4") or [] if "interface" in s))
     v6_ifaces = list(dict.fromkeys(
-        s["interface"] for s in cfg["subnets"]["ipv6"] if "interface" in s))
-    if not v4_ifaces:
+        s["interface"] for s in cfg["subnets"].get("ipv6") or [] if "interface" in s))
+    if cfg["subnets"].get("ipv4") and not v4_ifaces:
         die("subnets.ipv4 entries must include an 'interface' field")
-    if not v6_ifaces:
+    if cfg["subnets"].get("ipv6") and not v6_ifaces:
         die("subnets.ipv6 entries must include an 'interface' field")
 
     lines = [
@@ -882,6 +1191,30 @@ def _kea_class_lifetimes(cls, lease_profiles, family):
     return out
 
 
+def _kea_v4_t1_t2_option_data(cls, lease_profiles):
+    """T1/T2 option-data entries for a Kea DHCPv4 client class.
+
+    Kea has no per-client-class renew-timer/rebind-timer -- those exist only
+    at subnet and global scope -- so T1 and T2 travel the same way they do in
+    the ISC output, as DHCPv4 options 58 and 59 inside the class.  Without
+    this a class on a short bring-up lease_profile got its lifetimes from Kea
+    but no T1/T2, so ISC and Kea disagreed on renewal timing for exactly the
+    classes doing TLS enrolment.
+
+    DHCPv6 has no equivalent: T1/T2 are fields of the IA_NA, not options, and
+    Kea sets them per subnet.  The v6 class carries lifetimes only.
+    """
+    lp = resolve_lease_params(cls, lease_profiles, "ipv4")
+    if not lp:
+        return []
+    out = []
+    if "renewal_time" in lp:
+        out.append({"name": "dhcp-renewal-time", "data": str(lp["renewal_time"])})
+    if "rebinding_time" in lp:
+        out.append({"name": "dhcp-rebinding-time", "data": str(lp["rebinding_time"])})
+    return out
+
+
 def gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles):
     g       = cfg["global"]
     subnets = cfg["subnets"]["ipv4"]
@@ -914,6 +1247,8 @@ def gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles):
         }
         if mtu:
             entry["option-data"].append({"name": "interface-mtu", "data": str(mtu)})
+        # T1/T2 as options 58/59, mirroring the ISC class block (new in 2.4.0)
+        entry["option-data"].extend(_kea_v4_t1_t2_option_data(cls, lease_profiles))
         # Per-class lifetimes (new in 2.2.0)
         entry.update(_kea_class_lifetimes(cls, lease_profiles, "ipv4"))
         return entry
@@ -1100,6 +1435,97 @@ def gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles):
 
 
 # ---------------------------------------------------------------------------
+# --explain: what each class actually sends
+#
+# Built on resolve_suboptions(), the same structured form the Kea emitter
+# consumes and which is byte-checked against the ISC builders before anything
+# is written.  So this cannot drift from what is emitted: if it did, generation
+# would already be refusing to run.
+# ---------------------------------------------------------------------------
+
+def _explain_value(s):
+    """Render one structured sub-option's value for a human."""
+    code, data = s["code"], s["data"]
+    if code == 0x86:
+        return f"{'TLS' if str(data) == '1' else 'SSH'}  (0x{int(data):02x})"
+    if code == 0x87:
+        proto = {v: k for k, v in CALLHOME_PORTS.items()}.get(int(data))
+        return f"{data}" + (f"  ({proto.upper()} call-home)" if proto else "")
+    if s["type"] == "string":
+        return f'"{data}"'
+    return str(data)
+
+
+def explain(cfg, controllers, lease_profiles, ca_ra_profiles):
+    """Print, per class and family, the vendor option an O-RU will receive."""
+    eid     = cfg["global"]["oran_enterprise_id"]
+    classes = cfg.get("oru_classes", [])
+
+    print(f"\n{'=' * 72}")
+    print(f"What each O-RU class receives — oran-dhcp-gen v{__version__}")
+    print(f"{'=' * 72}")
+
+    for cls in classes:
+        name   = cls["name"]
+        prefix = cls["match_prefix"]
+        ctrl   = controllers[cls["controller"]]
+        proto  = cls["protocol"]
+
+        print(f"\n{name}"
+              + (f"   — {cls['description']}" if cls.get("description") else ""))
+        if prefix == "":
+            print(f'  matches   anything not matched above (catch-all)')
+        else:
+            print(f'  matches   vendor class starting "{prefix}"  '
+                  f'({len(prefix)} bytes)')
+        detail = f"  protocol  {proto}    controller {cls['controller']}"
+        if cls.get("lease_profile"):
+            detail += f"    lease_profile {cls['lease_profile']}"
+        print(detail)
+        mtu = (cls.get("options") or {}).get("interface_mtu")
+        if mtu:
+            print(f"  option 26 interface-mtu {mtu}  (IPv4 only)")
+
+        for family, range_key, opt_desc in (
+            ("ipv4", "ipv4_range", "DHCPv4 option 43"),
+            ("ipv6", "ipv6_range", f"DHCPv6 option 17, enterprise {eid}"),
+        ):
+            if range_key not in cls:
+                print(f"  {family:<9} not served (no {range_key})")
+                continue
+            parser = parse_ipv4_range if family == "ipv4" else parse_ipv6_range
+            start, end = parser(cls[range_key], name)
+            subs = resolve_suboptions(family, cls, controllers, ca_ra_profiles)
+            _, hex_str, raw = resolve_tlv(family, cls, controllers, ca_ra_profiles)
+
+            print(f"  {family:<9} {start} - {end}")
+            print(f"            {opt_desc} — {len(raw)} bytes, "
+                  f"{len(subs)} sub-option(s)")
+            for s_ in subs:
+                label = SUBOPT_LABELS.get(s_["code"], "?")
+                print(f"              0x{s_['code']:02x}  {label:<18} "
+                      f"{_explain_value(s_)}")
+            print(f"            wire: {hex_str}")
+
+        if proto == "tls" and resolve_callhome_port(cls) is None:
+            print(f"  !         no 0x87: the O-RU picks its own call-home port. "
+                  f"Firmware defaulting to\n"
+                  f"            {CALLHOME_PORTS['ssh']} (the SSH port) will "
+                  f"never complete a TLS session. Add\n"
+                  f"            'callhome_port: auto' to send "
+                  f"{CALLHOME_PORTS['tls']}.")
+        if proto == "tls" and cls.get("ca_ra") is None:
+            print(f"  note      no ca_ra block: only the controller IP and mode "
+                  f"go out. Correct for\n"
+                  f"            an O-RU that already holds a certificate; add "
+                  f"'ca_ra:' if it must enrol.")
+
+    print(f"\n{'=' * 72}")
+    print("Nothing was written — --explain only reports.")
+    print(f"{'=' * 72}\n")
+
+
+# ---------------------------------------------------------------------------
 # Deploy helpers
 # ---------------------------------------------------------------------------
 
@@ -1166,6 +1592,10 @@ def main():
     parser.add_argument("--outdir", default=None,
                         help="Output directory (default: temp dir with --deploy, "
                              "current dir otherwise)")
+    parser.add_argument("--explain", action="store_true",
+                        help="Print what each O-RU class will actually receive "
+                             "— the decoded option 43 / option 17 sub-options "
+                             "per class per family — and write nothing")
     parser.add_argument("--deploy", action="store_true",
                         help="Deploy generated configs to system paths "
                              "with timestamped backups")
@@ -1185,6 +1615,9 @@ def main():
 
     if args.restart and not args.deploy:
         die("--restart requires --deploy to be specified")
+    if args.explain and (args.deploy or args.restart):
+        die("--explain only reports; it cannot be combined with "
+            "--deploy or --restart")
 
     yaml_path = Path(args.input)
     if not yaml_path.exists():
@@ -1204,6 +1637,10 @@ def main():
 
     controllers, lease_profiles, ca_ra_profiles = validate(cfg)
 
+    if args.explain:
+        explain(cfg, controllers, lease_profiles, ca_ra_profiles)
+        return
+
     if args.deploy and args.outdir is None:
         import tempfile
         outdir = Path(tempfile.mkdtemp(prefix="oran-dhcp-gen-"))
@@ -1214,26 +1651,30 @@ def main():
 
     generated = []
 
-    if args.target in ("isc", "all"):
-        for fname, gen_func in (
-            ("dhcpd.conf",      lambda: gen_isc_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
-            ("dhcpd6.conf",     lambda: gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
-            ("isc-dhcp-server", lambda: gen_isc_defaults(cfg)),
-        ):
+    # A file for a family the deployment does not serve is not written.  With
+    # both families defined -- every reference input -- this changes nothing.
+    def _emit(entries):
+        for fname, family, gen_func in entries:
+            if family and not cfg["subnets"].get(family):
+                print(f"[SKIP] {fname}: no subnets.{family} defined")
+                continue
             out = outdir / fname
             out.write_text(gen_func())
             print(f"[OK] Generated: {out}")
             generated.append((fname, out))
 
+    if args.target in ("isc", "all"):
+        _emit((
+            ("dhcpd.conf",      "ipv4", lambda: gen_isc_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("dhcpd6.conf",     "ipv6", lambda: gen_isc_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("isc-dhcp-server", None,   lambda: gen_isc_defaults(cfg)),
+        ))
+
     if args.target in ("kea", "all"):
-        for fname, gen_func in (
-            ("kea-dhcp4.conf",  lambda: gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
-            ("kea-dhcp6.conf",  lambda: gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
-        ):
-            out = outdir / fname
-            out.write_text(gen_func())
-            print(f"[OK] Generated: {out}")
-            generated.append((fname, out))
+        _emit((
+            ("kea-dhcp4.conf",  "ipv4", lambda: gen_kea_v4(cfg, controllers, lease_profiles, ca_ra_profiles)),
+            ("kea-dhcp6.conf",  "ipv6", lambda: gen_kea_v6(cfg, controllers, lease_profiles, ca_ra_profiles)),
+        ))
 
     print(f"\n[DONE] Output written to: {outdir}/")
 

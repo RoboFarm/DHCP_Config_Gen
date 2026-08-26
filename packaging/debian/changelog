@@ -1,3 +1,358 @@
+oran-dhcp-gen (2.9.0) stable; urgency=medium
+
+  * The TLS sub-option encoding is now confirmed against a deployment this
+    tool did not configure. References/srsllsc1/ records the DHCPv6 option 17
+    chain that a second stack in the same lab puts on the wire, captured by
+    the O-RU itself, in a run where CMPv2 completed in ten seconds and TLS
+    call-home came up. oran-dhcp-gen reproduces that 142-byte chain byte for
+    byte, and test_generator_reproduces_srsllsc1_observed_chain holds it
+    there. Everything else in this suite compares the generator against
+    itself, a hand-written config, or a reading of the spec; this is the
+    first check against a working third-party implementation, and it settles
+    0x01, 0x03, 0x04, 0x05, 0x06, 0x81 and 0x86 on the DHCPv6 side.
+  * That capture also retires the leading theory about Lab04's enrolment
+    loop. srsllsc1 advertises the identical subject_dn -- the same 69 bytes
+    2.8.6 flagged as unconfirmed -- and its O-RU enrolled without complaint.
+    A subject_dn that does not match the CA certificate's own subject is
+    therefore not what makes an O-RU re-enrol forever. What differs between
+    the two is the CA host: ::38:c works, ::2c:6 loops, with the same port,
+    path, protocol and DN. That points at the responder, not the DHCP
+    payload, and the Lab4 TLS model's header now says so.
+  * Single-family deployments are supported. subnets now needs only one of
+    ipv4/ipv6 rather than both, a controller needs an address only for the
+    families its classes serve, and the files for an unserved family are not
+    written at all (with an empty INTERFACESv4/v6 in isc-dhcp-server so the
+    init script does not start that daemon). srsllsc1 runs an IPv6-only
+    M-plane; requiring an IPv4 subnet there meant inventing a network, and
+    since a dual-stack O-RU calls home over IPv6 the invented half was the
+    one nobody would ever look at.
+  * Two new fatal checks close the gaps that opening this up would otherwise
+    leave. A class serving a family its controller has no address for used to
+    be impossible to express and would now emit a chain with no 0x81 for that
+    family -- a lease that looks healthy and never leads anywhere. A class
+    with a range in a family that has no subnet would be silently dropped.
+    Both now die() with the fix named.
+  * No change to any existing output: all four reference inputs define both
+    families, and the only golden-file diff in this release is the version
+    banner -- one line per file, twenty files, nothing else.
+
+ -- labuser <labuser@dhcp-server>  Tue, 26 Aug 2026 00:30:00 +0000
+
+oran-dhcp-gen (2.8.6) stable; urgency=medium
+
+  * Walked back an overstated claim. 2.8.5 said every CA/RA value in the Lab4
+    TLS model was confirmed against the running lab. That was true of the
+    addresses, the port, the URI path and the protocol. It was not true of
+    subject_dn in the sense the wording implied.
+    Sub-option 0x05 is the CA/RA server's own Subject Name -- how the O-RU
+    identifies the CA whose response it should trust. What was actually
+    checked is that the DN matches what Lab04 puts on the wire, and that
+    Lab01 and Lab03 send the same string. Neither establishes that it matches
+    the subject of the certificate this lab's CA signs with, and Lab04 runs a
+    different CA implementation from Lab03 -- a Python 'orucara' responder
+    rather than EJBCA.
+    "Matches what is deployed" is not "verified correct", and the file header
+    now says which one this is, with the openssl command to settle it.
+  * Context for why this matters: on Lab04 the CA is issuing certificates
+    successfully every seven seconds, to a new serial each time, in an endless
+    loop. The O-RU is enrolling and then not accepting what comes back, which
+    is the shape a 0x05 mismatch takes -- the CA never errors, so nothing in
+    its log looks wrong.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 22:05:00 +0000
+
+oran-dhcp-gen (2.8.5) stable; urgency=medium
+
+  * The Lab4 TLS model's CA/RA profile is now confirmed end to end. The last
+    two values still inherited from the stale `tls_ca:` sketch -- uri_path
+    /pkix/ and app_protocol http -- were checked against the running CA: a
+    plain-HTTP GET to http://[fd00:8b36:f2a9::2c:6]:8080/pkix/ is answered by
+    the CMP responder with "405 CMP requires POST", which only that path and
+    that scheme produce. A wrong path would 404.
+    Nothing in that profile is guesswork any more, and the file header says so.
+  * The dual-stack IPv6 rule recorded in 2.8.4 is confirmed by the O-RU
+    itself, not just asserted. A 44R14 on Lab04 received both chains and wrote
+    the v6 values to its dhcp_scan_file.json:
+      ca_ra_ip_address "[fd00:8b36:f2a9::2c:6]", port 8080, protocol_flag 1
+    Its own decode of the option 17 chain matches the generated model
+    sub-option for sub-option, and the vendor option length it reported
+    (152 = 4 enterprise + 148) is exactly what --explain predicts.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 21:50:00 +0000
+
+oran-dhcp-gen (2.8.4) stable; urgency=medium
+
+  * Recorded a domain rule that changes how a deployment should be verified:
+    a dual-stack O-RU calls home over IPv6. When a class serves both families
+    the O-RU takes an address on each and the IPv6 chain governs call-home, so
+    option 17 is the operative payload and option 43 is not what the radio
+    acts on.
+    Three consequences worth having written down. For such a class the IPv6 CA
+    address, IPv6 controller and the ipv6 entry of a per-family ca_ra.port are
+    the values that reach the radio. A per-family port mapping is therefore
+    decided by its ipv6 entry. And a DHCPv4 capture -- which is what confirmed
+    the Lab04 deployment in 2.8.3 -- proves the generator emitted what was
+    asked for, but says nothing about the path actually in use; confirming a
+    dual-stack deployment needs a DHCPv6 capture (port 546 or 547) decoded
+    against --explain's ipv6 section.
+    Documentation only; no generated output changes. It is recorded because
+    the verification claims in this changelog read stronger than they are
+    without it.
+  * The user guide's version table was missing rows for 2.8.2 and 2.8.3; added.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 19:05:00 +0000
+
+oran-dhcp-gen (2.8.3) stable; urgency=medium
+
+  * FIX the Lab4 TLS model carried two wrong values, and 2.8.2 wrongly
+    recorded one of them as confirmed. Lab04 deployed the model and a tcpdump
+    of the DHCP Offer to a 44R14 was decoded against it:
+
+        0x03 CA/RA port    model 8091   wire 8080
+        0x05 subject DN    model /OU=SPM/O=1Finity/C=US/CN=ATT-SSL/...
+                           wire  /CN=1FinityLab Root CA/OU=WV Lab/...
+
+    Both came from the commented-out `tls_ca:` block in oran_dhcp.yaml, which
+    is stale in every value it recorded: the CA address was wrong (fixed in
+    2.8.2), and so were the port and the subject DN. uri_path and
+    app_protocol came from the same block and happen to be right.
+    2.8.2's header claimed the port was "confirmed against the running CMP
+    endpoint" on the strength of a report that it had been checked; the
+    capture shows it had been checked and corrected, not confirmed. Recording
+    a value as verified on second-hand wording is the same failure this tool
+    exists to prevent, one level up.
+  * The model is now byte-identical to what Lab04 serves: the generated
+    option 43 for ATTn77 matches the 108 bytes captured on br-mplane exactly.
+    The header records that, and which two values had to move to get there.
+  * The subject DN is now the same one Lab01 and Lab03 send, so all three
+    labs share the 1FinityLab root CA.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 18:45:00 +0000
+
+oran-dhcp-gen (2.8.2) stable; urgency=medium
+
+  * The Lab4 TLS model now carries the lab's real CA/RA addresses, confirmed
+    by the operator: 192.168.44.6 and fd00:8b36:f2a9::2c:6. The placeholder
+    IPv4 address 2.8.1 shipped is gone.
+    Worth recording: the CA runs on the controller host itself, so 0x01 and
+    0x81 carry the same address on each family -- the same arrangement Lab01
+    uses, and unlike Lab03 where they are separate hosts.
+    Also worth recording: the commented-out `tls_ca:` block those settings
+    were otherwise recovered from named the CA at fd00:8b36:f2a9::95:240,
+    which is stale. The file's header now says which values are confirmed and
+    which are only recovered, and flags port 8091 -- which came from that same
+    stale block -- as not re-confirmed.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 15:35:00 +0000
+
+oran-dhcp-gen (2.8.1) stable; urgency=medium
+
+  * NEW References/kea/Lab4/oran_dhcp-tls.yaml -- the Lab4 model with NETCONF
+    call-home over TLS actually turned on, rather than only made expressible.
+    Everything the earlier releases added existed but was switched on nowhere
+    a lab deploys from: Lab4 was still every class on ssh with no CA/RA
+    profile at all.
+    The CA/RA settings are recovered from the commented-out 'tls_ca:' block
+    that shipped in oran_dhcp.yaml beside it -- CA IPv6 fd00:8b36:f2a9::95:240,
+    port 8091, /pkix/, the SPM subject DN, http. That block recorded no IPv4
+    CA address, so ca_server_ipv4 is a clearly marked placeholder and the file
+    says so at the top; run --explain and read the 0x01 line before deploying.
+    It is a separate file rather than a rewrite of oran_dhcp.yaml, which
+    records what the lab runs today and is a regression-test input.
+    The catch-all opts out of both the CA/RA block and 0x87 -- an unrecognised
+    O-RU has no business being pointed at a CA -- so its chain is byte-identical
+    to the SSH model, which a test pins.
+  * FIX a malformed address anywhere in the model surfaced as a raw
+    ipaddress.AddressValueError traceback instead of an [ERROR] line. It
+    reached ipaddress inside a TLV builder, well past validation, so nothing
+    said which field was wrong. Controller and CA/RA addresses are now parsed
+    during validate() and a bad one dies naming the field:
+
+      [ERROR] ca_ra_profile 'att_spm' ca_server_ipv4: 'REPLACE-ME' is not a
+              valid ipv4 address (Expected 4 octets in 'REPLACE-ME')
+
+    This matters more than it looks: the new TLS model ships a placeholder
+    address on purpose, and a placeholder that tracebacks is a placeholder
+    nobody can act on.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 15:20:00 +0000
+
+oran-dhcp-gen (2.8.0) stable; urgency=medium
+
+  * NEW sub-option 0x02, CA/RA server FQDN, via a ca_ra_profile's
+    'ca_server_fqdn'. It reaches the CA by name and serves both families from
+    one value, so a profile can drop its per-family addresses entirely:
+
+        ca_ra_profiles:
+          onefinity_ca:
+            ca_server_fqdn: "ca.mplane.local"
+            uri_path:       "/pkix/"
+            subject_dn:     "/CN=1FinityLab Root CA/..."
+            app_protocol:   "http"
+
+    Setting both an address and a FQDN emits 0x01 then 0x02, in code order.
+  * A ca_ra_profile must now offer at least one of ca_server_ipv4,
+    ca_server_ipv6 or ca_server_fqdn, and an address-only profile must carry
+    the address family every referring class actually serves. Before, an
+    IPv4-only profile referenced by a dual-stack class produced a v6 CA/RA
+    chain with no CA address in it -- a config that validates and cannot
+    enrol.
+  * Audited the emitter's sub-option coverage and wrote the result into the
+    user guide, with the basis for each mapping stated rather than asserted.
+    Nine of the ten codes are verified against working lab configs: Lab03 is
+    decisive for 0x01 vs 0x81 because its CA and controller are different
+    hosts, and it carries 0x82 as the named alternative to 0x81.
+    0x02 is the exception and is documented as inferred, not read from the
+    spec: it fills the only gap in the 0x01-0x06 CA/RA run and mirrors 0x82
+    against 0x81. O-RAN.WG4.MP.0 clause 6.2.5 could not be retrieved to
+    confirm it, and one public summary of an early revision describes the low
+    codes as controller rather than CA/RA information -- a reading that
+    contradicts how both labs use 0x01, and most likely describes a revision
+    in which option 43 carried controller information only. Confirm 0x02
+    against the specification before relying on it in production.
+    Nothing claims the ten codes are the complete set.
+  * The reference models deliberately do not use 0x02, so no shipped example
+    endorses an unverified mapping; it is covered by inline test models only.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 14:55:00 +0000
+
+oran-dhcp-gen (2.7.0) stable; urgency=medium
+
+  * NEW --explain prints what each O-RU class will actually receive and writes
+    nothing:
+
+        oran-dhcp-gen oran_dhcp.yaml --explain
+
+    Per class and family: the vendor-class prefix it matches, its pool range,
+    and the option 43 / option 17 chain decoded sub-option by sub-option --
+    CA/RA server and port, URI path, subject DN, controller IP, call-home mode
+    and port -- followed by the flat hex so it can be compared against a
+    capture. Until now the only way to see what a class sends was to read a hex
+    chain out of the generated config by hand, or to put an O-RU on the wire
+    and run tcpdump.
+    The report is built on resolve_suboptions(), the same structured form the
+    Kea backend consumes and which is byte-checked against the ISC builders
+    before anything is emitted, so it cannot disagree with what is generated.
+    test_explain_wire_matches_the_generated_config decodes both and compares
+    them for every class and family in all three reference models.
+    It also flags what a byte dump alone would not: a TLS class sending no
+    0x87 is called out with the port the O-RU will fall back to, and a TLS
+    class with no ca_ra block is noted as controller-only.
+    --explain cannot be combined with --deploy or --restart.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 14:05:00 +0000
+
+oran-dhcp-gen (2.6.0) stable; urgency=medium
+
+  * NEW top-level 'defaults:' block. Every oru_class inherits controller,
+    protocol, callhome_port, lease_profile, ca_ra and options from it unless it
+    sets its own, so switching a lab between SSH and TLS is one edit instead of
+    one edit per class:
+
+        defaults:
+          controller: ctrl
+          protocol: tls
+          callhome_port: auto
+          ca_ra:
+            profile: onefinity_ca
+
+    Turning that 'protocol' line back to ssh drops every class from the full
+    CA/RA chain to a bare controller IP. Previously the same change meant
+    editing protocol, callhome_port and ca_ra on every class in the file, and
+    the failure mode was missing one -- a single class still on ssh, or still
+    on tls, looking exactly like the others in the YAML.
+    Keys a class sets always win, and presence is what counts, not truth:
+    'ca_ra:' with no value on a class overrides an inherited block with
+    nothing. 'ca_ra' merges one level deep, so a class needing only its own
+    port keeps the inherited profile. A CA/RA block is not inherited into an
+    SSH class, which would otherwise make every SSH class in a TLS-by-default
+    lab warn about a block it never asked for. 'defaults:' rejects keys that
+    define a class rather than configure it -- name, match_prefix, the ranges.
+  * NEW a class with 'protocol: tls' and no 'callhome_port' now warns. This is
+    the failure sub-option 0x87 exists to prevent: 0x86 tells the O-RU to use
+    TLS, nothing tells it which port, so it falls back to its firmware default
+    -- 4334, the SSH call-home port, on the Fujitsu units. TLS call-home never
+    completes, the lease looks healthy, and both dhcpd -t and kea-dhcp4 -t
+    pass, so it reads as an O-RU fault. Both TLS classes in the Lab01
+    reference are in exactly this state and were silent until now.
+    A warning rather than an error: firmware that already defaults to 4335 is
+    fine, and refusing would break configs that work today.
+  * The Lab01 reference model now demonstrates 'defaults:' -- its classes
+    spell out only what differs. Generated output is unchanged.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 12:55:00 +0000
+
+oran-dhcp-gen (2.5.0) stable; urgency=medium
+
+  * NEW ca_ra.port accepts a per-family mapping, not only a scalar:
+
+        ca_ra:
+          profile: onefinity_ca
+          port:
+            ipv4: 8081
+            ipv6: 8080
+
+    Lab01 reaches the same CMP endpoint on a different port per family --
+    TDDn77 on v4 8081 / v6 8080, FDDn25n66 on v4 8083 / v6 8082 -- which the
+    scalar form could not express: one value went into sub-option 0x03 for
+    both families, so v6 clients would have been sent the v4 port. A scalar
+    still means "same port for both" and is unchanged. A mapping that omits a
+    family the class actually serves is rejected rather than defaulted, since
+    silently falling back reintroduces the same wrong-port failure.
+  * NEW References/isc/Lab01 -- the hand-written dhcpd.conf and dhcpd6.conf a
+    second lab ran, plus the oran_dhcp.yaml that reproduces them. Unlike Lab03
+    this lab puts the CA/RA endpoint on the controller host itself and sends
+    /pkix/ rather than the EJBCA CMP path.
+  * NEW test_generator_reproduces_lab01_vendor_chains decodes the option-43 and
+    option-17 chains out of those hand-written files and requires the generated
+    ones to match per class per family. Comments, logging and line breaks are
+    allowed to differ; the bytes that reach an O-RU are not.
+  * FIX the test helpers that decode ISC vendor chains matched the first
+    "option vendor-encapsulated-options" text anywhere in a class block, so a
+    commented-out alternative chain above the live one was decoded instead --
+    Lab01's FDDn25n66 v6 block keeps its SSH variant commented directly above
+    the TLS one, and the helper read 0x0081 where the wire carries 0x0001.
+    Both decoders are now anchored to the start of a line.
+
+ -- labuser <labuser@dhcp-server>  Mon, 25 Aug 2026 02:40:00 +0000
+
+oran-dhcp-gen (2.4.0) stable; urgency=medium
+
+  * NEW callhome_port on an oru_class emits O-RAN sub-option 0x87, the NETCONF
+    call-home port. Takes an integer or 'auto', which resolves to the RFC 8071
+    port for the class protocol -- SSH 4334, TLS 4335. Until now a class could
+    say "use TLS" (sub-option 0x86 = 0x01) but had no way to say which port, so
+    the O-RU fell back to its firmware default. On the Fujitsu units in the lab
+    that default is 4334, the SSH call-home port: the O-RU opened a TLS
+    connection to the SSH listener and call-home never completed. The
+    hand-written Lab03 ISC configs carried 0x87 (87:02:10:ee) in their
+    alternate option chains; the generator could not express it in either
+    backend.
+    The field is opt-in. A model that does not set it emits no 0x87 and its
+    wire bytes are byte-identical to 2.3.0 -- upgrading does not change what a
+    deployed lab sends.
+  * FIX Kea DHCPv4 dropped T1/T2. A class on a lease_profile with renewal_time
+    and rebinding_time got those as options 58/59 in the ISC class block, but
+    the Kea config carried only the lifetimes, so the two backends renewed on
+    different schedules -- for exactly the short bring-up profiles the TLS
+    enrolment classes use. Kea has no per-client-class renew-timer/rebind-timer,
+    so they are now emitted as class option-data the way ISC emits them.
+    DHCPv6 is unaffected: T1/T2 are IA_NA fields there, not options.
+  * FIX 'tls_ca:' under a controller is now a hard error naming ca_ra_profiles.
+    It was never an implemented field, but a commented-out tls_ca block shipped
+    in the Lab4 reference YAML, so uncommenting it read as the way to turn on
+    TLS bootstrap. The generator ignored it and emitted a payload with no CA/RA
+    sub-options, silently. Unknown fields on a controller, a class or a ca_ra
+    block are now reported as warnings for the same reason.
+  * The Lab4 reference YAML documents the three edits that turn a class from
+    SSH to TLS call-home, in place of the tls_ca sketch it used to carry.
+  * Tests: 0x87 must agree between the two backends and match the protocol
+    (a TLS class emitting port 4334 fails), lab4 must stay free of 0x87 so the
+    opt-in claim is checked, Kea and ISC must agree on T1/T2, and both tls_ca
+    and an out-of-range callhome_port must be rejected without a traceback.
+
+ -- labuser <labuser@dhcp-server>  Mon, 24 Aug 2026 22:40:00 +0000
+
 oran-dhcp-gen (2.3.0) stable; urgency=medium
 
   * NEW --no-timestamp: omit the generation time from config headers so that

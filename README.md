@@ -9,7 +9,7 @@ matches that prefix to a class and returns the NETCONF controller address in the
 vendor options — DHCPv4 **option 43** and DHCPv6 **option 17** (enterprise ID **53148**) —
 so the O-RU knows where to call home (SSH 4334 / TLS 4335).
 
-Current version: **2.3.0** · Python 3, no dependencies beyond `python3-yaml`.
+Current version: **2.9.0** · Python 3, no dependencies beyond `python3-yaml`.
 
 ## Repository layout
 
@@ -23,6 +23,7 @@ Current version: **2.3.0** · Python 3, no dependencies beyond `python3-yaml`.
 | `docs/ORAN_DHCP_USER_GUIDE.md` | User guide |
 | `References/isc/Lab03/` | Hand-written ISC configs from a real lab, predating the generator |
 | `References/kea/Lab4/` | A working `oran_dhcp.yaml` plus the Kea configs generated from it |
+| `References/srsllsc1/` | A DHCPv6 option 17 chain captured off the wire where TLS call-home works, plus the model that reproduces it byte for byte |
 | `CLAUDE.md` | Architecture notes, invariants, and the domain rules that constrain edits |
 
 Build output goes to `build/` and `dist/`, both gitignored.
@@ -108,6 +109,20 @@ a "v2.2.3 installed" header.)
   sub-options for Kea to encode itself. `resolve_suboptions()` re-encodes the structured form
   and aborts generation if it does not match the ISC bytes exactly. Change one representation
   and you must change the other.
+- **`protocol: tls` alone does not finish the job.** Sub-option `0x86` tells the O-RU to
+  use TLS but not which port, so it falls back to its firmware default — 4334, the SSH
+  call-home port on the Fujitsu units — and the TLS listener never sees it. Set
+  `callhome_port: auto` on the class (sub-option `0x87`, NEW in 2.4.0). The field is
+  opt-in: a model that omits it emits no `0x87` and its wire bytes are unchanged.
+- **`--explain` shows what each class actually sends**, decoded sub-option by sub-option,
+  without deploying anything or reaching for tcpdump. It is built on the same structured form
+  the Kea backend consumes, and a test compares its output against the generated configs, so
+  it cannot drift from what is emitted.
+- **A `defaults:` block turns TLS on or off lab-wide in one edit.** Classes inherit
+  `controller`, `protocol`, `callhome_port`, `lease_profile`, `ca_ra` and `options` unless they
+  set their own. Editing `protocol` on every class was how one got missed.
+- `ca_ra.port` is per-class **and optionally per-family** (`{ipv4: N, ipv6: M}`). Lab01 reaches
+  the same CA on v4 8081 / v6 8080, so a single scalar would send the v4 port to v6 clients.
 - Kea must emit *typed* per-sub-option data, never a pre-built blob. Versions 2.2.0–2.2.2
   nested the whole payload under sub-option `0x01`, so Kea wrapped it in its own TLV; O-RUs
   skipped the unknown code and never learned the controller IP, while `kea-dhcp4 -t` still

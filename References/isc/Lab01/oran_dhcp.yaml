@@ -1,0 +1,96 @@
+# oran_dhcp.yaml — Lab01
+#
+# The data model that reproduces the hand-written dhcpd.conf / dhcpd6.conf in
+# this directory. Those two files came from the lab and predate the generator;
+# they are the semantic target, not byte-exact expected output (the generator
+# emits its own comments and multi-line formatting). What must match exactly is
+# the option 43 / option 17 sub-option chain of every class, which
+# test_generator_reproduces_lab01_vendor_chains checks per class per family.
+#
+# Lab01 differs from Lab03 in three ways worth knowing:
+#   * The CA/RA server and the NETCONF controller are the SAME host
+#     (192.168.56.12 / fd00:8b36:f2a9::38:0c). In Lab03 they are separate.
+#   * The CA/RA port differs PER FAMILY for the same class — v4 8081 / v6 8080
+#     for TDDn77, v4 8083 / v6 8082 for FDDn25n66. That is why ca_ra.port
+#     accepts a mapping; a scalar would send the v4 port to v6 clients.
+#   * No callhome_port is set, so no 0x87 goes out and each O-RU uses its
+#     firmware default. This matches the captured lab config. Add
+#     `callhome_port: auto` to state 4335 explicitly.
+
+global:
+  default_lease_time: 43200
+  max_lease_time:     86400
+  oran_enterprise_id: 53148
+
+controllers:
+  - name: ctrl
+    description: "Lab01 controller — also hosts the CA/RA (CMP) endpoint"
+    ipv4: "192.168.56.12"
+    ipv6: "fd00:8b36:f2a9::38:0c"
+
+ca_ra_profiles:
+  onefinity_ca:
+    description: "1FinityLab Root CA — same host as the controller"
+    ca_server_ipv4: "192.168.56.12"                 # sub-opt 0x01, IPv4 output
+    ca_server_ipv6: "fd00:8b36:f2a9::38:0c"         # sub-opt 0x01, IPv6 output
+    uri_path:       "/pkix/"                        # sub-opt 0x04
+    subject_dn:     "/CN=1FinityLab Root CA/OU=WV Lab/O=1Finity/L=Richardson/ST=Texas/C=US"
+    app_protocol:   "http"                          # sub-opt 0x06
+
+# Everything every class shares. Switching this lab between SSH and TLS is the
+# single `protocol:` line below — a class only spells out what it does
+# differently. Add `callhome_port: auto` here to send sub-option 0x87 (4335)
+# lab-wide; it is left out so this file reproduces the captured configs byte
+# for byte.
+defaults:
+  controller: ctrl
+  protocol: tls
+  ca_ra:
+    profile: onefinity_ca
+
+oru_classes:
+
+  - name: TDDn77
+    description: "TDD n77 RU (Fujitsu 44R14 series) — TLS with CMP enrolment"
+    match_prefix: "o-ran-ru2/FJ/44R14"
+    ipv4_range: "192.168.56.100-119"
+    ipv6_range: "fd00:8b36:f2a9::160-169"
+    ca_ra:
+      port:                                 # sub-opt 0x03, per family
+        ipv4: 8081                          # profile is inherited
+        ipv6: 8080
+
+  - name: FDDn25n66
+    description: "FDD n25/n66 RU (Fujitsu 44R26 series) — TLS with CMP enrolment"
+    match_prefix: "o-ran-ru2/FJ/44R26"
+    ipv4_range: "192.168.56.130-159"
+    ipv6_range: "fd00:8b36:f2a9::170-179"
+    ca_ra:
+      port:
+        ipv4: 8083
+        ipv6: 8082
+
+  # Catch-all — keep last. SSH, controller IP only (sub-opt 0x81). Overriding
+  # protocol here is all it takes to opt one class out of the TLS default; the
+  # CA/RA block is not inherited into an SSH class.
+  - name: Unmatched
+    description: "Fallback for unrecognised vendor-class strings"
+    match_prefix: ""
+    protocol: ssh
+    ipv4_range: "192.168.56.180-189"
+    ipv6_range: "fd00:8b36:f2a9::180-199"
+    options:
+      interface_mtu: 1440
+
+subnets:
+  ipv4:
+    - subnet: "192.168.56.0/24"
+      gateway: "192.168.56.1"
+      interface: "br-mplane"
+      # No DNS option — matches the captured dhcpd.conf
+
+  ipv6:
+    - subnet: "fd00:8b36:f2a9::/64"
+      dns_servers:
+        - "fd00:8b36:f2a9::1"
+      interface: "br-mplane"

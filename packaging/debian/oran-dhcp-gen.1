@@ -20,6 +20,14 @@ Output target (default: isc).
 .B \-\-outdir DIR
 Output directory (default: temp dir when --deploy, current dir otherwise).
 .TP
+.B \-\-explain
+Print what each O-RU class will actually receive \-\- the vendor-class prefix
+it matches, its pool range, and the option 43 / option 17 chain decoded
+sub-option by sub-option, followed by the flat hex for comparison against a
+capture \-\- and write nothing. Flags a \fItls\fR class that sends no 0x87
+with the port the O-RU will fall back to. Cannot be combined with
+\-\-deploy or \-\-restart.
+.TP
 .B \-\-deploy
 Deploy generated configs to system paths with timestamped backups.
 Requires root/sudo to write to /etc/dhcp/, /etc/kea/, /etc/default/.
@@ -29,7 +37,7 @@ Restart DHCP services after successful deploy. Requires --deploy.
 .TP
 .B \-\-version
 Show version and exit.
-.SH "YAML SCHEMA (v2.2.0)"
+.SH "YAML SCHEMA"
 The YAML model has four top-level sections plus oru_classes:
 .TP
 .B global
@@ -45,13 +53,36 @@ Named reusable lease parameter sets. Reference from a class via
 .TP
 .B ca_ra_profiles (optional, NEW in 2.2.0)
 Named reusable TLS CA/RA bootstrap settings (CA server IP, URI path,
-subject DN, app protocol, NETCONF mode byte). Reference from a class
+subject DN, app protocol). The CA is reached by address
+(\fIca_server_ipv4\fR/\fIca_server_ipv6\fR, sub-option 0x01) or by name
+(\fIca_server_fqdn\fR, sub-option 0x02, serving both families) or both; at
+least one is required. Reference from a class
 via \fIca_ra: { profile: <name>, port: N, ... }\fR.
+.IP
+\fIca_ra.port\fR is either a single number for both families or, since
+2.5.0, a mapping \fI{ipv4: N, ipv6: M}\fR for a CA reached on a different
+port per family. A mapping that omits a family the class serves is an error,
+not a fallback.
+.TP
+.B defaults (optional, NEW in 2.6.0)
+Class settings applied to every oru_class that does not set its own:
+\fIcontroller\fR, \fIprotocol\fR, \fIcallhome_port\fR, \fIlease_profile\fR,
+\fIca_ra\fR, \fIoptions\fR. Switching a lab between SSH and TLS is then the
+one \fIprotocol\fR line here rather than one edit per class. A class setting
+always wins; \fIca_ra\fR merges one level deep and is not inherited into an
+\fIssh\fR class.
 .TP
 .B oru_classes
 List of O-RU classes. \fIipv4_range\fR and \fIipv6_range\fR are now
 both optional (NEW in 2.2.0); omit to disable that family for the class.
 At least one must be present.
+.IP
+\fIcallhome_port\fR (NEW in 2.4.0) emits sub-option 0x87, the NETCONF
+call-home port: an integer, or \fIauto\fR for the RFC 8071 port matching
+the class protocol (SSH 4334, TLS 4335). Omit it and no 0x87 is sent, which
+leaves the O-RU on its firmware default. A \fIprotocol: tls\fR class whose
+firmware defaults to 4334 opens a TLS connection to the SSH listener and
+never calls home, so set this whenever a class is switched to TLS.
 .SH DEPLOY PATHS
 .TP
 dhcpd.conf \-> /etc/dhcp/dhcpd.conf
