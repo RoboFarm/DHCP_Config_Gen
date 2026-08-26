@@ -43,9 +43,12 @@
 # and the issued cert: oru-cara Sub-CA) are signed by "1FinityLab Issuing
 # CA", which is in neither list. The chain to the Root that 0x05 names can't
 # be built; openssl verify reproduces it exactly ("unable to get local
-# issuer certificate" at depth 1). The fix is orucara including
-# /opt/cmp/pki/issuingca.pem in extraCerts. The DN this model sends in 0x05
-# matches the delivered Root certificate's subject RDN for RDN.
+# issuer certificate" at depth 1). The fix was one line in oru-cara.yaml --
+# chain: [subca, issuingca, root] instead of [subca, root] -- and was
+# confirmed the same day: the first "confirmed serial" ever logged by
+# orucara, 62 ms after issuance, and the 7-second loop stopped. The DN this
+# model sends in 0x05 matches the delivered Root certificate's subject RDN
+# for RDN.
 #
 # To see exactly what an O-RU will be sent, without writing anything:
 #     oran-dhcp-gen oran_dhcp-tls.yaml --explain
