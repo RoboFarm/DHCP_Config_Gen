@@ -33,11 +33,19 @@
 # loop on enrolment; this string is what a working deployment sends. See
 # References/srsllsc1/ for the capture and the test that pins it.
 #
-# What still differs between there and here is the CA host itself: srsllsc1
-# points 0x01/0x81 at fd00:8b36:f2a9::38:c, this model at ::2c:6. Same port,
-# same path, same protocol, same DN. If an O-RU loops against ::2c:6 while
-# the identical chain works against ::38:c, the fault is in that responder,
-# not in the DHCP payload.
+# The Lab04 enrolment loop itself was root-caused on 2026-08-26 by decoding
+# the CMP exchange off the wire, and it is not a DHCP problem. Each cycle is
+# ir -> ip with status accepted and a fresh certificate, and the O-RU never
+# sends certConf: it rejects the response. orucara's CMP mechanics are right
+# (transactionID and nonce echoes correct, response signed), but its ip
+# carries extraCerts [mplane.lab, oru-cara Sub-CA, Root] and caPubs [Sub-CA,
+# Root] -- and BOTH chains the O-RU must validate (protection: mplane.lab,
+# and the issued cert: oru-cara Sub-CA) are signed by "1FinityLab Issuing
+# CA", which is in neither list. The chain to the Root that 0x05 names can't
+# be built; openssl verify reproduces it exactly ("unable to get local
+# issuer certificate" at depth 1). The fix is orucara including
+# /opt/cmp/pki/issuingca.pem in extraCerts. The DN this model sends in 0x05
+# matches the delivered Root certificate's subject RDN for RDN.
 #
 # To see exactly what an O-RU will be sent, without writing anything:
 #     oran-dhcp-gen oran_dhcp-tls.yaml --explain
