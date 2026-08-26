@@ -21,6 +21,7 @@ Current version: **2.9.0** · Python 3, no dependencies beyond `python3-yaml`.
 | `tests/run_tests.py` | Test suite — runs with or without pytest |
 | `tests/golden/` | Expected output for both reference inputs |
 | `docs/ORAN_DHCP_USER_GUIDE.md` | User guide |
+| `docs/TLS_CALLHOME_FINDINGS.md` | Findings, issues and resolutions from the TLS call-home bring-up (2.4.0–2.9.0), DHCP through CMPv2 to call-home |
 | `References/isc/Lab03/` | Hand-written ISC configs from a real lab, predating the generator |
 | `References/kea/Lab4/` | A working `oran_dhcp.yaml` plus the Kea configs generated from it |
 | `References/srsllsc1/` | A DHCPv6 option 17 chain captured off the wire where TLS call-home works, plus the model that reproduces it byte for byte |
